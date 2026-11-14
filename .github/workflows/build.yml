@@ -83,7 +83,7 @@ jobs:
             }
           }
 
-      - name: Build payload (BTA-Audio-2.7.5.bin)
+      - name: Build payload (BTA-Audio-1.1.bin)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -100,13 +100,13 @@ jobs:
         with:
           name: btaudio4-ps4-14.02
           path: |
-            build/BTA-Audio-2.7.5.bin
-            build/Bluetooth-Audio-2.7.5.pkg
+            build/BTA-Audio-1.1.bin
+            build/Bluetooth-Audio-1.1.pkg
 
       - name: Create GitHub Release on tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/BTA-Audio-2.7.5.bin
-            build/Bluetooth-Audio-2.7.5.pkg
+            build/BTA-Audio-1.1.bin
+            build/Bluetooth-Audio-1.1.pkg

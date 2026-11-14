@@ -141,7 +141,7 @@ static void snapshot(void){
  sceKernelClose(fd);logline("snapshot: written");
 }
 int main(void){
- sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);logline("Bluetooth Audio 2.7.5 native app starting");
+ sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);logline("Bluetooth Audio 1.1 native app starting");
  int video=sceVideoOutOpen(0xff,0,0,0);if(video<0){logline("VideoOutOpen failed");return 1;}
  off_t memory;size_t size=8*1024*1024;void*base=0;
  if(sceKernelAllocateDirectMemory(0,sceKernelGetDirectMemorySize(),size,0x200000,3,&memory)<0||sceKernelMapDirectMemory(&base,size,0x33,0,memory,0x200000)<0){logline("Video memory failed");return 2;}
@@ -163,7 +163,8 @@ int main(void){
   if(now>=poll){refresh();poll=now+(!online?2000000:(l==BT_LINK_STREAMING?300000:500000));}
   if(!state.pin_pending)pinignore=0;if(state.pin_pending&&!pinmode&&!pinignore){pinmode=1;digit=0;memcpy(pin,"0000",5);}
   unsigned buttons=controller(now);
-  /* A button still held from launching the app is not a new press. */
+  /* A button still held from launching or resuming the app is not a new press. */
+  if(!pad_connected)armed=0;
   if(!armed&&pad_connected){previous=buttons;armed=1;}
   unsigned pressed=buttons&~previous;
   if(buttons==previous&&now>=repeat){pressed=buttons&(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN|ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT|ORBIS_PAD_BUTTON_L1|ORBIS_PAD_BUTTON_R1);repeat=now+150000;}
