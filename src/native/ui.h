@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include "../app/protocol.h"
+#include "../payload/protocol.h"
 #include "ui_font.h"
 #include "ui_icons.h"
 
