@@ -10,9 +10,9 @@ Requirements: jailbroken PS4 on **14.02**, **GoldHEN** with **FTP (port 2121)** 
 
 ### Option A: Home-screen app (PKG)
 
-`Bluetooth-Audio-1.1.pkg` installs **Bluetooth Audio** (`BTAD00001`) and bundles the payload.
+`BTAudio4-1.1.1.pkg` installs **BTAudio4** (`BTAD00001`) and bundles the payload.
 
-1. Copy `Bluetooth-Audio-1.1.pkg` to `/data/pkg/Bluetooth-Audio-1.1.pkg` via FTP (or install from USB).
+1. Copy `BTAudio4-1.1.1.pkg` to `/data/pkg/BTAudio4-1.1.1.pkg` via FTP (or install from USB).
 2. On the PS4, open **GoldHEN → Debug Settings → Package Installer** and install the PKG. (Delete any older version from the home screen first.)
 3. Ensure **BinLoader (port 9090)** is enabled, then launch **Bluetooth Audio** from the home screen.
 
@@ -21,13 +21,13 @@ Requirements: jailbroken PS4 on **14.02**, **GoldHEN** with **FTP (port 2121)** 
 Send the flat payload directly from your PC (do not open a bare connection to port 9090, as BinLoader only accepts one payload per jailbreak):
 
 ```powershell
-python tools/deploy_variant.py build/BTA-Audio-1.1.bin --host <PS4_IP> --connect
+python tools/deploy_variant.py build/BTAudio4-1.1.1.bin --host <PS4_IP> --connect
 ```
 
 Optional GoldHEN AutoRun install:
 
 ```powershell
-python tools/install_bta.py --host <PS4_IP> --payload build/BTA-Audio-1.1.bin
+python tools/install_bta.py --host <PS4_IP> --payload build/BTAudio4-1.1.1.bin
 python tools/install_bta.py --host <PS4_IP> --disable-autorun   # undo
 ```
 
@@ -46,8 +46,8 @@ Put your headphones in pairing mode, then pair and connect using either:
 
 | Path | Description |
 |---|---|
-| `build/Bluetooth-Audio-1.1.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
-| `build/BTA-Audio-1.1.bin` | Built flat payload |
+| `build/BTAudio4-1.1.1.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
+| `build/BTAudio4-1.1.1.bin` | Built flat payload |
 | `src/payload/` | Payload source (launcher, A2DP worker, web UI, device cache, BT accept patch) |
 | `src/native/` | OpenOrbis home-screen app source and asset generator |
 | `tools/` | Build, FTP install, and payload deploy scripts |
@@ -57,8 +57,8 @@ Put your headphones in pairing mode, then pair and connect using either:
 Requires `..\toolchain` beside the repo (`toolchain/llvm/bin` and `toolchain/OpenOrbis/PS4Toolchain`), Python (with Pillow + matplotlib), and .NET for `PkgTool.Core`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTA-Audio-1.1.bin
-powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/Bluetooth-Audio-1.1.pkg
+powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTAudio4-1.1.1.bin
+powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/BTAudio4-1.1.1.pkg
 ```
 
 ## Credits & Licenses

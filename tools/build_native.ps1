@@ -23,19 +23,19 @@ if ($LASTEXITCODE) { throw 'Native fself failed' }
 Copy-Item -LiteralPath (Join-Path $out 'icon0.png') -Destination (Join-Path $pkg 'sce_sys/icon0.png') -Force
 Copy-Item -LiteralPath (Join-Path $sdk 'samples/hello_world/sce_sys/about/right.sprx') -Destination (Join-Path $pkg 'sce_sys/about/right.sprx') -Force
 foreach ($module in @('libc.prx','libSceFios2.prx')) { Copy-Item -LiteralPath (Join-Path $sdk "samples/hello_world/sce_module/$module") -Destination (Join-Path $pkg "sce_module/$module") -Force }
-Copy-Item -LiteralPath (Join-Path $root 'build/BTA-Audio-1.1.bin') -Destination (Join-Path $pkg 'assets/BTA-Audio.bin') -Force
+Copy-Item -LiteralPath (Join-Path $root 'build/BTAudio4-1.1.1.bin') -Destination (Join-Path $pkg 'assets/BTA-Audio.bin') -Force
 $sfo = Join-Path $pkg 'sce_sys/param.sfo'
 $tool = Join-Path $bin 'PkgTool.Core.exe'
 & $tool sfo_new $sfo
 if ($LASTEXITCODE) { throw 'SFO create failed' }
 # CATEGORY 'gde' (Non-Game Mini App) and ATTRIBUTE 32 (0x20) let PS4 suspend the app alongside an active game.
 $entries = @(
-    @('APP_TYPE','Integer','4','1'), @('APP_VER','Utf8','8','01.10'),
+    @('APP_TYPE','Integer','4','1'), @('APP_VER','Utf8','8','01.11'),
     @('ATTRIBUTE','Integer','4','32'), @('CATEGORY','Utf8','4','gde'),
     @('CONTENT_ID','Utf8','48','IV0000-BTAD00001_00-BTAUDIO000000001'),
     @('DOWNLOAD_DATA_SIZE','Integer','4','0'), @('SYSTEM_VER','Integer','4','0'),
-    @('TITLE','Utf8','128','Bluetooth Audio'), @('TITLE_ID','Utf8','12','BTAD00001'),
-    @('VERSION','Utf8','8','01.10')
+    @('TITLE','Utf8','128','BTAudio4'), @('TITLE_ID','Utf8','12','BTAD00001'),
+    @('VERSION','Utf8','8','01.11')
 )
 foreach ($entry in $entries) {
     & $tool sfo_setentry $sfo $entry[0] --type $entry[1] --maxsize $entry[2] --value $entry[3]
@@ -48,7 +48,7 @@ try {
     & $tool pkg_build package.gp4 $out
     if ($LASTEXITCODE) { throw 'PKG build failed' }
 } finally { Pop-Location }
-Copy-Item -LiteralPath (Join-Path $out 'IV0000-BTAD00001_00-BTAUDIO000000001.pkg') -Destination (Join-Path $root 'build/Bluetooth-Audio-1.1.pkg') -Force
-& $tool pkg_validate (Join-Path $root 'build/Bluetooth-Audio-1.1.pkg')
+Copy-Item -LiteralPath (Join-Path $out 'IV0000-BTAD00001_00-BTAUDIO000000001.pkg') -Destination (Join-Path $root 'build/BTAudio4-1.1.1.pkg') -Force
+& $tool pkg_validate (Join-Path $root 'build/BTAudio4-1.1.1.pkg')
 if ($LASTEXITCODE) { throw 'PKG validation failed' }
-Write-Output 'Built and validated build/Bluetooth-Audio-1.1.pkg'
+Write-Output 'Built and validated build/BTAudio4-1.1.1.pkg'
