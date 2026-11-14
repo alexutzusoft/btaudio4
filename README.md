@@ -1,0 +1,70 @@
+# PS4 Bluetooth Audio (14.02)
+
+Homebrew for a **jailbroken PS4 on firmware 14.02 (14.020.001)** running GoldHEN. Sends game audio from the console's built-in Bluetooth radio straight to Bluetooth Classic headphones—no dongle or PC in the audio path. Output only (no microphone).
+
+> **Experimental.** Targets firmware `14.020.001` only (the payload verifies kernel instruction fingerprints before patching and aborts on mismatches). Patches live in RAM only and disappear on reboot.
+
+## Install
+
+Requirements: jailbroken PS4 on **14.02**, **GoldHEN** with **FTP (port 2121)** and **BinLoader (port 9090)** enabled.
+
+### Option A: Home-screen app (PKG)
+
+`Bluetooth-Audio-2.7.5.pkg` installs **Bluetooth Audio** (`BTAD00001`) and bundles the payload.
+
+1. Copy `Bluetooth-Audio-2.7.5.pkg` to `/data/pkg/Bluetooth-Audio-2.7.5.pkg` via FTP (or install from USB).
+2. On the PS4, open **GoldHEN → Debug Settings → Package Installer** and install the PKG. (Delete any older version from the home screen first.)
+3. Ensure **BinLoader (port 9090)** is enabled, then launch **Bluetooth Audio** from the home screen.
+
+### Option B: Payload only
+
+Send the flat payload directly from your PC (do not open a bare connection to port 9090, as BinLoader only accepts one payload per jailbreak):
+
+```powershell
+python tools/deploy_variant.py build/BTA-Audio-2.7.5.bin --host <PS4_IP> --connect
+```
+
+Optional GoldHEN AutoRun install:
+
+```powershell
+python tools/install_bta.py --host <PS4_IP> --payload build/BTA-Audio-2.7.5.bin
+python tools/install_bta.py --host <PS4_IP> --disable-autorun   # undo
+```
+
+## Usage
+
+Put your headphones in pairing mode, then pair and connect using either:
+- **Home-screen app:** `Triangle` scan/disconnect, `D-pad` select, `X` connect/start service, `Square` toggle TV sound, `Circle` close app (service stays running).
+- **Web UI:** `http://<PS4_IP>:8097/` from any browser on your local network (no authentication—use on a trusted network only).
+
+**Tips:**
+- If a pair connects with no sound, try reconnecting or toggling **Joint Stereo** off per headphone in the web UI.
+- If a pair won't appear in scans, remove it in **Settings → Devices → Bluetooth Devices** first, then put it back in pairing mode.
+- Runtime state and logs live in `/data/bta_audio/` (check `/data/bta_audio/app.log` if the service fails to start).
+
+## Files
+
+| Path | Description |
+|---|---|
+| `build/Bluetooth-Audio-2.7.5.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
+| `build/BTA-Audio-2.7.5.bin` | Built flat payload (SHA-256 `b285c2079c6c67fb1dce5363dce9d1be7c4e315c4d0df1b8a5e21496514f716c`) |
+| `src/payload/` | Payload source (launcher, A2DP worker, web UI, device cache, BT accept patch) |
+| `src/native/` | OpenOrbis home-screen app source and asset generator |
+| `tools/` | Build, FTP install, and payload deploy scripts |
+
+## Build from source
+
+Requires `..\toolchain` beside the repo (`toolchain/llvm/bin` and `toolchain/OpenOrbis/PS4Toolchain`), Python (with Pillow + matplotlib), and .NET for `PkgTool.Core`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTA-Audio-2.7.5.bin
+powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/Bluetooth-Audio-2.7.5.pkg
+```
+
+## Credits & Licenses
+
+- Font assets: DejaVu (`src/native/LICENSE_DEJAVU.txt`).
+- AutoRun entry format: documented in [orbisRPC](https://github.com/SirHumza/orbisRPC/tree/main/installer).
+- Requires [GoldHEN](https://github.com/GoldHEN/GoldHEN) (not included).
+- The PKG bundles OpenOrbis sample modules (`libc.prx`, `libSceFios2.prx`, `right.sprx`) from [OpenOrbis-PS4-Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain).
+- Project code is released under the [MIT License](LICENSE).
