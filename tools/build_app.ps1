@@ -22,6 +22,10 @@ foreach ($item in ,@('bt_accept_patch','bta_apply_patch')) {
     if ($LASTEXITCODE) { throw "Compile failed: $($item[0])" }
     $objects += $obj
 }
+$obj = Join-Path $build 'kresolve.o'
+& $clang @flags -mgeneral-regs-only -c (Join-Path $root 'src/payload/kresolve.c') -o $obj
+if ($LASTEXITCODE) { throw 'Compile failed: kresolve' }
+$objects += $obj
 $obj = Join-Path $build 'bt_devices.o'
 & $clang @flags -mgeneral-regs-only -c (Join-Path $root 'src/payload/bt_devices.c') -o $obj
 if ($LASTEXITCODE) { throw 'Compile failed: bt_devices' }
@@ -29,6 +33,6 @@ $objects += $obj
 $script = Join-Path $root 'src/payload/payload.ld'
 & $linker -T $script @objects -o (Join-Path $build 'BTA-Audio.debug.elf')
 if ($LASTEXITCODE) { throw 'ELF link failed' }
-& $linker --oformat=binary -T $script @objects -o (Join-Path $root 'build/BTAudio4-1.2.0.bin')
+& $linker --oformat=binary -T $script @objects -o (Join-Path $root 'build/BTAudio4-1.3.0.bin')
 if ($LASTEXITCODE) { throw 'Binary link failed' }
-Write-Output 'Built build/BTAudio4-1.2.0.bin'
+Write-Output 'Built build/BTAudio4-1.3.0.bin'

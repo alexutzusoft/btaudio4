@@ -16,7 +16,7 @@ struct app{
  int(*sleep)(unsigned);u64(*clock)(void);int(*shm)(const char*,int,int);
  void*(*map)(void*,u64,int,int,int,u64);int(*unmap)(void*,u64);
  long listener,bt,hdmi,shmfd;u8*ring;u32 readpos;int wanted,streaming,tv,muted,quit,phase;
- long patch_rc,packet_rc,connect_rc,last_rc,hdmi_rc,btstate;
+ long patch_rc,packet_rc,connect_rc,last_rc,hdmi_rc,btstate,list_rc;
  u64 next_try,deadline,scan_at,heartbeat,poll_at,net_at,packets,errors,resyncs;
  unsigned level;int volume;char message[128];
  /* Per-packet timing, summarised per second (GET /api/timing). gap: time between two
@@ -87,9 +87,15 @@ static void link_lost(struct app*a){
 }
 static struct bt_device*device(struct app*a,u64 address){for(unsigned i=0;i<a->devices.count;i++)if(a->devices.items[i].address==address)return &a->devices.items[i];return 0;}
 static int ensure_bt(struct app*a){if(a->bt>=0)return 0;a->bt=sc3(5,(long)"/dev/bt",6,0);if(a->bt<0)return -1;u64 mask=0xffffff;sc3(4,a->bt,(long)&mask,8);return 0;}
-static void refresh_devices(struct app*a){struct bt_devices d;if(!bt_list(&d)&&d.count<=BT_DEVICE_LIMIT)a->devices=d;struct bt_device*t=device(a,a->target.address);if(t)a->target=*t;}
+static void refresh_devices(struct app*a){
+ struct bt_devices d;memset(&d,0,sizeof(d));
+ int rc=bt_list(&d);
+ a->list_rc=rc;
+ if(!rc&&d.count<=BT_DEVICE_LIMIT)a->devices=d;
+ struct bt_device*t=device(a,a->target.address);if(t)a->target=*t;
+}
 static void end_scan(struct app*a){if(a->scanning&&a->bt>=0)sc3(54,a->bt,0x20046205,0);a->scanning=0;}
-static int scan(struct app*a){if(ensure_bt(a))return -1;long rc=sc3(54,a->bt,0x20046204,0);if(rc<0)return -1;a->scanning=1;a->scan_end=a->clock()+16000000;a->list_at=0;return 0;}
+static int scan(struct app*a){if(ensure_bt(a))return -1;if(sc3(54,a->bt,0x20046204,0)<0)return -1;a->scanning=1;a->scan_end=a->clock()+16000000;a->list_at=0;return 0;}
 struct saved_device{u64 magic;struct bt_device device;};
 static int save_target(struct app*a,const struct bt_device*d){
  struct saved_device s={.magic=0x3254454752415442UL,.device=*d};
@@ -115,7 +121,8 @@ static void load_volume(struct app*a){
  if(n==sizeof(value)&&value<=100)a->volume=(int)value;
 }
 static void begin_connect(struct app*a){
- a->patch_rc=bta_apply_patch();if(a->patch_rc){retry(a,"Bluetooth setup failed. Check the diagnostic status.");return;}
+ a->patch_rc=bta_apply_patch();
+ if(a->patch_rc){retry(a,"Bluetooth setup failed. Check the diagnostic status.");return;}
  if(ensure_bt(a)){retry(a,"Bluetooth is not ready. Retrying shortly.");return;}
  refresh_devices(a);struct bt_device*t=device(a,a->target.address);
  if(!t){if(scan(a)){retry(a,"Bluetooth scan could not start. Retrying shortly.");return;}a->phase=4;a->deadline=a->clock()+16000000;say(a,"Looking for ","... Put it in pairing mode if needed.");return;}
@@ -228,6 +235,7 @@ static void number(struct writer*w,long n){char b[24];unsigned i=0;u64 v;if(n<0)
 static void field(struct writer*w,const char*key,long value){append(w,",\"");append(w,key);append(w,"\":");number(w,value);}
 static void quoted(struct writer*w,const char*s){append(w,"\"");for(unsigned i=0;s[i]&&i<127;i++){char c=s[i];if(c=='"'||c=='\\')append(w,"\\");char b[2]={(c>=32&&c<127)?c:'?',0};append(w,b);}append(w,"\"");}
 static void mac_text(u64 address,char out[13]){const char digits[]="0123456789ABCDEF";for(int i=0;i<12;i++)out[i]=digits[(address>>(44-4*i))&15];out[12]=0;}
+
 static u64 parse_mac(const char*p){u64 v=0;for(int i=0;i<12;i++){char c=p[i];unsigned n;if(c>='0'&&c<='9')n=c-'0';else if(c>='A'&&c<='F')n=c-'A'+10;else if(c>='a'&&c<='f')n=c-'a'+10;else return 0;v=(v<<4)|n;}if(!starts(p+12," HTTP/1."))return 0;return v;}
 /* The one place the connection's real state is decided. A UI must show this,
  * never infer it from "selected" or "wanted". */
@@ -243,8 +251,8 @@ static int retry_in_ms(struct app*a,u64 now){return(a->wanted&&!a->streaming&&!a
 static int quiet_for_ms(struct app*a,u64 now){if(!a->streaming||now<a->ok_at)return 0;u64 ms=(now-a->ok_at)/1000;return ms>2000000000UL?2000000000:(int)ms;}
 static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
- struct writer w={out,0,cap};append(&w,"{\"version\":\"1.2.0\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
- field(&w,"volume",a->volume);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",exists(NO_WIDEN));field(&w,"uptime_us",a->clock());
+ struct writer w={out,0,cap};append(&w,"{\"version\":\"1.3.0\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
+ field(&w,"volume",a->volume);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",exists(NO_WIDEN));field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;

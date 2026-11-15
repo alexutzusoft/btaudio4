@@ -1,60 +1,151 @@
-/* 13.52 / 14.02 locked snapshot of the driver's existing Classic device cache,
- * and the same normal HCI packet-type request used by the proven BTA bridge.
- * Device selection is runtime data; the audio service check remains enforced. */
+/* Firmware-independent locked snapshot of the driver's existing Classic device cache,
+ * and the normal HCI packet-type request used by the proven BTA bridge.
+ * Kernel symbols and bounds are discovered dynamically and cached per worker run. */
 #include "protocol.h"
-typedef unsigned long u64;
-__attribute__((noinline)) static long sc3(long n,long a,long b,long c){long o;__asm__ volatile("syscall; jnc 1f; neg %%rax; 1:":"=a"(o),"+d"(c),"+D"(a),"+S"(b):"a"(n):"rcx","r8","r9","r10","r11","cc","memory");return o;}
-struct input{u64 address;int mode;unsigned version;struct bt_devices*out;};
-struct args{void*fn;struct input*input;};
-static int callback(void*td,struct args*a){
- (void)td;unsigned lo,hi;__asm__ volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(0xc0000082));u64 base=(((u64)hi<<32)|lo)-0x1c0;
- if((base>>48)!=0xffff||(base&0x3fff))return 22;
- unsigned ver=a->input->version;
- u64 cache_fn,cmd_fn,lock_fn,unlock_fn,ctx_ptr,fmt_str,copyout_fn;
- if(ver==0x13520001){
-  cache_fn=0x5b7570;cmd_fn=0x5ae3b0;lock_fn=0x5a73f0;unlock_fn=0x5a7470;
-  ctx_ptr=0x2612550;fmt_str=0xad7562;copyout_fn=0x2bd6a0;
- }else if(ver==0x14020001){
-  cache_fn=0x5b7550;cmd_fn=0x5aeae0;lock_fn=0x5a7b20;unlock_fn=0x5a7ba0;
-  ctx_ptr=0x2612750;fmt_str=0xad7d22;copyout_fn=0x2bdc50;
- }else{
-  return 22;
- }
- if(*(u64*)(base+cache_fn)!=0x56415741e5894855UL||*(u64*)(base+cmd_fn)!=0x56415741e5894855UL)return 22;
- /* Input is the calling worker's private stack, as in existing syscall-11 helpers. */
- u64 address=a->input->address;int mode=a->input->mode;struct bt_devices*destination=a->input->out;
- if(mode!=0&&mode!=1)return 22;if(mode==1&&(!address||address>>48))return 22;
- struct bt_devices out;for(unsigned i=0;i<sizeof(out);i++)((volatile unsigned char*)&out)[i]=0;
- int(*lock)(void)=(void*)(base+lock_fn);int(*unlock)(int)=(void*)(base+unlock_fn);
- int rc=lock();if(rc)return rc;unsigned char*ctx=*(void**)(base+ctx_ptr);
- if(!ctx||((u64)ctx>>48)!=0xffff){unlock(0);return 6;}
- if(mode==0){
-  /* Bounds/stride recovered from cache lookup (13.52 +5b7570, 14.02 +5b7550) and name lookup (13.52 +5b89c0, 14.02 +5b9060). */
-  for(unsigned off=0x18da8;off<0x20ea8;off+=0x408){
-   unsigned char*d=ctx+off;u64 mac=*(u64*)d;if(!mac||mac>>48)continue;
-   struct bt_device*v=&out.items[out.count++];v->address=mac;v->cod=*(unsigned*)(d+8);v->services=*(unsigned*)(d+0x20);v->flags=*(unsigned*)(d+0x24);
-   for(unsigned i=0;i<sizeof(v->name)-1;i++){unsigned char c=d[0x80+i];if(!c)break;v->name[i]=(c>=32&&c<127)?c:'?';}
-   if(out.count==BT_DEVICE_LIMIT)break;
-  }
- }else{
-  rc=2;
-  for(unsigned off=0x42a8;off<0xd960;off+=0x1588){unsigned char*c=ctx+off;if(*(u64*)(c+0x30)!=address)continue;
-   unsigned char*d=*(void**)(c+0x638);if(!d||((u64)d>>48)!=0xffff||!(*(unsigned*)(d+0x20)&8)){rc=93;break;}
-   if(*(unsigned*)(c+0x1560)>=3){rc=0;break;}
-   int(*command)(void*,unsigned,const char*,...)=(void*)(base+cmd_fn);
-   rc=command(ctx,0x40f,(const char*)(base+fmt_str),(unsigned)*(unsigned short*)(c+0x48),0x3c18);
-   if(rc>=0){*(unsigned*)(c+0x1564)=0x3c18;rc=0;}break;
-  }
- }
- unlock(0);
- if(mode==0){int(*copyout)(const void*,void*,u64)=(void*)(base+copyout_fn);return copyout(&out,destination,sizeof(out));}
- return rc;
+#include "kresolve.h"
+
+__attribute__((noinline)) static long sc3(long n, long a, long b, long c) {
+    long o;
+    __asm__ volatile("syscall; jnc 1f; neg %%rax; 1:"
+                     : "=a"(o), "+d"(c), "+D"(a), "+S"(b)
+                     : "a"(n)
+                     : "rcx", "r8", "r9", "r10", "r11", "cc", "memory");
+    return o;
 }
-static int invoke(struct input*in){
- struct{u64 size;char text[28];unsigned version;}v={.size=40};int(*getver)(void*)=0;
- if(sc3(591,0x2001,(long)"sceKernelGetSystemSwVersion",(long)&getver)||!getver||getver(&v)||(v.version!=0x13520001&&v.version!=0x14020001))return 22;
- in->version=v.version;
- return (int)sc3(11,(long)callback,(long)in,0);
+
+struct resolve_args {
+    void *fn;
+    struct bt_koff *out;
+};
+
+struct input {
+    u64 address;
+    int mode;
+    const struct bt_koff *k;
+    struct bt_devices *out;
+};
+struct args {
+    void *fn;
+    struct input *input;
+};
+
+static struct bt_koff g_koff;
+
+static void zero_mem(void *p, u64 n) {
+    volatile u8 *b = (volatile u8 *)p;
+    for (u64 i = 0; i < n; i++) b[i] = 0;
 }
-int bt_list(struct bt_devices*out){struct input in={.mode=0,.out=out};return invoke(&in);}
-int bt_prepare(u64 address){struct input in={.address=address,.mode=1};return invoke(&in);}
+
+static int resolve_cb(void *td, struct resolve_args *a) {
+    (void)td;
+    u64 base = kr_find_base();
+    if (!base) return 101;
+    struct bt_koff res;
+    if (kr_resolve_bt(base, &res) || !res.copyout_fn) return 102;
+    if (*(const u32 *)res.copyout_fn != 0xe5894855U) return 103;
+    int (*copyout)(const void *, void *, u64) = (void *)res.copyout_fn;
+    return copyout(&res, a->out, sizeof(res));
+}
+
+static int callback(void *td, struct args *a) {
+    (void)td;
+    struct input *in = a->input;
+    const struct bt_koff *k = in ? in->k : 0;
+
+    u64 base = kr_find_base();
+    if (!base) return 22;
+    if (!k || !k->valid || k->base != base) return 22;
+    if (*(const u32 *)k->cache_fn != 0xe5894855U || *(const u32 *)k->cmd_fn != 0xe5894855U ||
+        *(const u32 *)k->copyout_fn != 0xe5894855U) {
+        return 22;
+    }
+
+    /* Input is the calling worker's private stack, as in existing syscall-11 helpers. */
+    u64 address = in->address;
+    int mode = in->mode;
+    struct bt_devices *destination = in->out;
+    if (mode != 0 && mode != 1) return 22;
+    if (mode == 1 && (!address || address >> 48)) return 22;
+
+    struct bt_devices out;
+    zero_mem(&out, sizeof(out));
+
+    int (*lock)(void) = (void *)k->lock_fn;
+    int (*unlock)(int) = (void *)k->unlock_fn;
+    int rc = lock();
+    if (rc) return rc;
+
+    unsigned char *ctx = *(void **)k->ctx_ptr;
+    if (!ctx || ((u64)ctx >> 48) != 0xffff) {
+        unlock(0);
+        return 6;
+    }
+
+    if (mode == 0) {
+        for (unsigned off = k->cache_off; off < k->cache_end; off += k->cache_stride) {
+            unsigned char *d = ctx + off;
+            u64 mac = *(u64 *)d;
+            if (!mac || mac >> 48) continue;
+            if (out.count < BT_DEVICE_LIMIT) {
+                struct bt_device *v = &out.items[out.count++];
+                v->address = mac;
+                v->cod = *(unsigned *)(d + 8);
+                v->services = *(unsigned *)(d + 0x20);
+                v->flags = *(unsigned *)(d + 0x24);
+                for (unsigned i = 0; i < sizeof(v->name) - 1; i++) {
+                    unsigned char c = d[0x80 + i];
+                    if (!c) break;
+                    v->name[i] = (c >= 32 && c < 127) ? c : '?';
+                }
+            }
+        }
+    } else {
+        rc = 2;
+        for (unsigned off = k->conn_off; off < k->conn_end; off += k->conn_stride) {
+            unsigned char *c = ctx + off;
+            if (*(u64 *)(c + 0x30) != address) continue;
+            unsigned char *d = *(void **)(c + k->conn_dev_off);
+            if (!d || ((u64)d >> 48) != 0xffff || !(*(unsigned *)(d + 0x20) & 8)) {
+                rc = 93;
+                break;
+            }
+            if (*(unsigned *)(c + k->conn_state_off) >= 3) {
+                rc = 0;
+                break;
+            }
+            int (*command)(void *, unsigned, const char *, ...) = (void *)k->cmd_fn;
+            rc = command(ctx, 0x40f, (const char *)k->fmt_str, (unsigned)*(unsigned short *)(c + k->conn_handle_off), 0x3c18);
+            if (rc >= 0) {
+                *(unsigned *)(c + k->conn_policy_off) = 0x3c18;
+                rc = 0;
+            }
+            break;
+        }
+    }
+
+    unlock(0);
+    if (mode == 0) {
+        int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
+        return copyout(&out, destination, sizeof(out));
+    }
+    return rc;
+}
+
+static int invoke(struct input *in) {
+    if (!g_koff.valid) {
+        long r = sc3(11, (long)resolve_cb, (long)&g_koff, 0);
+        if (r || !g_koff.valid) return r ? (int)r : 22;
+    }
+    in->k = &g_koff;
+    return (int)sc3(11, (long)callback, (long)in, 0);
+}
+
+int bt_list(struct bt_devices *out) {
+    struct input in = {.mode = 0, .out = out};
+    return invoke(&in);
+}
+
+int bt_prepare(u64 address) {
+    struct input in = {.address = address, .mode = 1};
+    return invoke(&in);
+}
