@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -70,18 +71,19 @@ static unsigned controller(uint64_t now){
 }
 
 /* ---- HTTP client: the audio service owns Bluetooth; this app only displays and requests ---- */
+enum { SOCKET_REFUSED = -2 };
 static int local_socket(int port){
  int fd=socket(AF_INET,SOCK_STREAM,0);if(fd<0)return -1;
  struct timeval t={1,0};setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&t,sizeof(t));setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&t,sizeof(t));
  int one=1;setsockopt(fd,SOL_SOCKET,0x800,&one,sizeof(one));
  struct sockaddr_in a;memset(&a,0,sizeof(a));a.sin_len=sizeof(a);a.sin_family=AF_INET;a.sin_port=htons(port);a.sin_addr.s_addr=htonl(0x7f000001);
- if(connect(fd,(void*)&a,sizeof(a))<0){close(fd);return -1;}return fd;
+ if(connect(fd,(void*)&a,sizeof(a))<0){int rc=errno==ECONNREFUSED?SOCKET_REFUSED:-1;close(fd);return rc;}return fd;
 }
 static int write_all(int fd,const void*p,size_t n){const char*b=p;while(n){ssize_t k=send(fd,b,n,0);if(k<=0)return -1;b+=k;n-=k;}return 0;}
-/* Returns the HTTP status code (e.g. 200, 409) or -1 on transport error. Copies
- * the response body (NUL-terminated) into out when provided. Every path closes fd. */
+/* Returns the HTTP status code, SOCKET_REFUSED if no listener, or -1 on other
+ * transport errors. Copies the NUL-terminated response body into out when provided. */
 static int http(const char*method,const char*path,void*out,size_t cap){
- int fd=local_socket(8097);if(fd<0)return -1;
+ int fd=local_socket(8097);if(fd<0)return fd;
  char request[256];int len=snprintf(request,sizeof(request),"%s %s HTTP/1.1\r\nHost: 127.0.0.1:8097\r\nX-BTA-Control: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",method,path);
  if(len<0||len>=(int)sizeof(request)||write_all(fd,request,(size_t)len)){close(fd);return -1;}
  char response[16384];size_t used=0;
@@ -134,26 +136,105 @@ static int refresh(void){
  online=1;log_service_change();return 0;
 }
 static void set_notice(const char*s){snprintf(notice,sizeof(notice),"%s",s);notice_until=g_now+6000000;}
-/* The audio service normally starts at boot (GoldHEN AutoRun). If it is not running
- * when the app opens, send the bundled payload to GoldHEN's local BinLoader (port 9090)
- * once. The payload's launcher refuses to start twice, and we only try while port 8097
- * is not answering. The payload goes out on a single connection: never probe 9090. */
-static void service_check(void){refresh();}
-static int launch_attempted;
-static void start_service(void){
- if(online||launch_attempted)return;launch_attempted=1;last_launch_try=g_now;
- static char payload[131072];
+
+enum service_phase { SERVICE_CHECK_VERSION, SERVICE_STOPPING, SERVICE_STARTING, SERVICE_MONITOR };
+static enum service_phase service_phase=SERVICE_CHECK_VERSION;
+static uint64_t service_deadline;
+static char payload[131072];
+static size_t payload_size;
+
+static int read_payload_version(char*version,size_t cap){
+ char body[96];
+ int code=http("GET","/api/version",body,sizeof(body));
+ /* Older workers reject unknown GET routes. They put the version first in /api/status. */
+ if(code==403||code==404)code=http("GET","/api/status",body,sizeof(body));
+ if(code!=200)return code;
+ static const char prefix[]="{\"version\":\"";
+ if(strncmp(body,prefix,sizeof(prefix)-1))return -1;
+ const char*value=body+sizeof(prefix)-1;
+ size_t len=strspn(value,"0123456789.");
+ if(!len||len>=cap||value[len]!='"')return -1;
+ memcpy(version,value,len);version[len]=0;
+ int parts[4];const char*pre;
+ return bta_parse_version(version,parts,&pre)==0?200:-1;
+}
+
+static int load_bundled_payload(void){
  int f=sceKernelOpen("/app0/assets/BTA-Audio.bin",0,0);
- if(f<0){logline("start: bundled payload not found");return;}
+ if(f<0){logline("start: bundled payload not found");set_notice("Bundled audio payload not found.");return -1;}
+ long n=0;
  size_t used=0;
- while(used<sizeof(payload)){long n=sceKernelRead(f,payload+used,sizeof(payload)-used);if(n<=0)break;used+=(size_t)n;}
+ while(used<sizeof(payload)){n=sceKernelRead(f,payload+used,sizeof(payload)-used);if(n<=0)break;used+=(size_t)n;}
  sceKernelClose(f);
- if(used<1024||used>=sizeof(payload)){logline("start: bundled payload size invalid");return;}
+ if(n<0||used<1024||used>=sizeof(payload)){
+  logline("start: could not read a complete bundled payload");
+  set_notice("Could not read the bundled audio payload.");return -1;
+ }
+ payload_size=used;return 0;
+}
+
+static void start_service(void){
+ service_phase=SERVICE_MONITOR;
+ if(!payload_size&&load_bundled_payload())return;
+ /* The BinLoader connection must carry the payload. A probe can consume its slot. */
+ last_launch_try=sceKernelGetProcessTime();
  int fd=local_socket(9090);
- if(fd<0){logline("start: BinLoader (9090) not reachable; enable it in GoldHEN and jailbreak again");return;}
- int rc=write_all(fd,payload,used);close(fd);
- {char msg[128];snprintf(msg,sizeof(msg),rc?"start: send failed (%zu bytes)":"start: payload sent to BinLoader (%zu bytes)",used);logline(msg);}
- if(!rc)set_notice("Starting audio service...");
+ if(fd<0){
+  logline("start: BinLoader (9090) not reachable; enable it in GoldHEN and jailbreak again");
+  set_notice("BinLoader unavailable. Enable it in GoldHEN or run the jailbreak again.");return;
+ }
+ int rc=write_all(fd,payload,payload_size);close(fd);
+ char msg[128];snprintf(msg,sizeof(msg),rc?"start: send failed (%zu bytes)":"start: payload sent to BinLoader (%zu bytes)",payload_size);logline(msg);
+ if(rc){set_notice("Could not send the audio payload to BinLoader.");return;}
+ service_phase=SERVICE_STARTING;
+ service_deadline=sceKernelGetProcessTime()+15000000;
+ set_notice("Starting audio service...");notice_until=service_deadline;
+}
+
+static void service_check(void){
+ if(online){refresh();return;}
+
+ char version[64];
+ int code=read_payload_version(version,sizeof(version));
+ if(code==200&&!strcmp(version,BTA_VERSION)){
+  if(refresh()==0&&service_phase!=SERVICE_MONITOR){
+   logline("service: payload version matches v" BTA_VERSION);
+   service_phase=SERVICE_MONITOR;notice[0]=0;
+  }
+  return;
+ }
+ if(service_phase==SERVICE_MONITOR)return;
+ if(service_phase==SERVICE_STARTING){
+  if(g_now>=service_deadline){
+   service_phase=SERVICE_MONITOR;
+   logline("start: v" BTA_VERSION " payload did not become ready");
+   set_notice("Audio payload did not start. Press X to retry.");
+  }
+  return;
+ }
+ if(code==SOCKET_REFUSED){start_service();return;}
+ if(service_phase==SERVICE_STOPPING){
+  if(g_now>=service_deadline){
+   service_phase=SERVICE_MONITOR;
+   logline("sync: timed out waiting for the old payload to release port 8097");
+   set_notice("Old audio payload did not stop. Press X to retry.");
+  }
+  return;
+ }
+ if(code!=200)return;
+
+ char msg[128];snprintf(msg,sizeof(msg),"sync: replacing payload v%s with v%s",version,BTA_VERSION);logline(msg);
+ if(!payload_size&&load_bundled_payload()){service_phase=SERVICE_MONITOR;return;}
+ code=http("POST","/api/quit",0,0);
+ if(code>=0&&code!=200){
+  service_phase=SERVICE_MONITOR;
+  snprintf(msg,sizeof(msg),"sync: shutdown request failed (HTTP %d)",code);logline(msg);
+  set_notice("Could not stop the old audio payload. Press X to retry.");return;
+ }
+ /* A dropped reply can still mean quit succeeded. Wait for the listener to close. */
+ service_phase=SERVICE_STOPPING;
+ service_deadline=sceKernelGetProcessTime()+15000000;
+ set_notice("Updating audio service...");notice_until=service_deadline;
 }
 static void action(const char*path){
  char body[160];int code=http("POST",path,body,sizeof(body));
@@ -174,12 +255,13 @@ static void volume_change(int amount){
 }
 static void activate(void){
  if(!online){
-  if(last_launch_try&&g_now-last_launch_try<5000000){
+  if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING)return;
+  if(last_launch_try&&g_now<last_launch_try+5000000){
    logline("activate: BinLoader retry skipped (cooldown; BinLoader may only accept 1 payload per jailbreak)");
    set_notice("Service offline. Wait a moment or re-enable BinLoader.");
    return;
   }
-  launch_attempted=0;service_check();start_service();return;
+  service_phase=SERVICE_CHECK_VERSION;service_check();return;
  }
  if(state.count<=0||focus<0||focus>=state.count)return;
  const struct bt_device*d=&state.devices[focus];int l=ui_link();
@@ -503,7 +585,7 @@ int main(void){
  int user_rc=sceUserServiceInitialize(&userparams);int pad_rc=scePadInit();
  char diag[128];snprintf(diag,sizeof(diag),"User init=0x%x Pad init=0x%x",user_rc,pad_rc);logline(diag);
  sceSystemServiceHideSplashScreen();
- logline("Checking audio service");service_check();start_service();
+ logline("Checking audio service");service_check();
  start_update_check();
  logline("Starting display loop");
  focus=0;for(int i=0;i<state.count;i++)if(state.devices[i].address==state.selected)focus=i;
@@ -530,9 +612,16 @@ int main(void){
    if(!dl_modal_dismissed)dl_state=__atomic_load_n(&g_dl_state,__ATOMIC_ACQUIRE);
    if(g_dl_log[0])logline(g_dl_log);
   }
+  if(now>=poll){
+   service_check();
+   uint64_t interval=2000000;
+   if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING)interval=250000;
+   else if(online)interval=ui_link()==BT_LINK_STREAMING?300000:500000;
+   poll=sceKernelGetProcessTime()+interval;
+  }
   int l=ui_link();
-  if(now>=poll){refresh();poll=now+(!online?2000000:(l==BT_LINK_STREAMING?300000:500000));}
-  if(!state.pin_pending)pinignore=0;if(state.pin_pending&&!pinmode&&!pinignore){pinmode=1;digit=0;memcpy(pin,"0000",5);}
+  if(!online||!state.pin_pending){pinmode=0;pinignore=0;}
+  if(online&&state.pin_pending&&!pinmode&&!pinignore){pinmode=1;digit=0;memcpy(pin,"0000",5);}
   unsigned buttons=controller(now);
   /* A button still held from launching or resuming the app is not a new press. */
   if(!pad_connected)armed=0;

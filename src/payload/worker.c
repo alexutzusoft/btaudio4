@@ -659,6 +659,10 @@ static void dispatch(struct app*a,struct client*c){
  char body[12000];
  if(!host_valid(c->input)){response(c,"403 Forbidden","text/plain","Use the PS4 IP address.",23);return;}
  if(starts(c->input,"GET / HTTP/1.")){response(c,"200 OK","text/html; charset=utf-8",web_page,sizeof(web_page)-1);return;}
+ if(starts(c->input,"GET /api/version HTTP/1.")){
+  static const char version[]="{\"version\":\"" BTA_VERSION "\"}";
+  response(c,"200 OK","application/json",version,sizeof(version)-1);return;
+ }
  if(starts(c->input,"GET /api/native HTTP/1.")){unsigned n=native_status(a,body);response(c,"200 OK","application/octet-stream",body,n);return;}
  if(starts(c->input,"GET /api/status HTTP/1.")){unsigned n=status(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  if(starts(c->input,"GET /api/timing HTTP/1.")){unsigned n=timing_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
@@ -916,6 +920,7 @@ void*bta_worker(void*arg){
  wlog_flush(&a,a.clock(),1);
  if(a.cond_rc==0)a.destroy_cond(&a.audio_cond);
  if(a.destroy_mutex)a.destroy_mutex(&a.mutex);
- for(int i=0;i<4;i++)closefd(a.clients[i].fd);closefd(a.listener);closefd(a.bt);closefd(a.hdmi);
+ for(int i=0;i<4;i++)closefd(a.clients[i].fd);
+ closefd(a.bt);closefd(a.hdmi);closefd(a.listener);
  return 0;
 }
