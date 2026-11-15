@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <string.h>
 #include "../payload/protocol.h"
+#include "../version.h"
+#include "version_check.h"
 #include "ui_font.h"
 #include "ui_icons.h"
 
@@ -36,9 +38,9 @@
 
 static uint32_t back[WIDTH*HEIGHT]; /* cached off-screen target; the video buffers are slow to read back */
 static struct bt_native state;
-static int online,ext_ok,focus,top,meter_s;
-static uint64_t g_now,testing_until,notice_until;
-static char notice[160];
+static int online,ext_ok,focus,top,meter_s,upd_state,upd_has_pkg,dl_state;
+static uint64_t g_now,testing_until,notice_until,dl_bytes,dl_total;
+static char notice[160],upd_latest[64],dl_pkg_name[128],dl_err[160];
 
 /* ---- drawing primitives. The PC previewer mirrors these exactly (integer math). ---- */
 static int cx0,cy0,cx1=WIDTH,cy1=HEIGHT;
@@ -182,6 +184,10 @@ static uint32_t link_color(int l){
   case BT_LINK_LOST:case BT_LINK_FAILED:case UI_OFFLINE:return RED;default:return GREY;}
 }
 static int secs(int ms){return(ms+999)/1000;}
+static void fmt_bytes(uint64_t b,char*out,size_t cap){
+ if(b>=1048576ULL){uint64_t t=(b*10+524288ULL)/1048576ULL;snprintf(out,cap,"%llu.%llu MB",(unsigned long long)(t/10),(unsigned long long)(t%10));}
+ else{uint64_t kb=(b+512ULL)/1024ULL;snprintf(out,cap,"%llu KB",(unsigned long long)kb);}
+}
 static void draw(int pinmode,const char*pin,int digit){
  uint64_t t=g_now/1000;int l=ui_link();uint32_t col=link_color(l);int n=state.count;
  int retry=ext_ok?state.retry_ms:0,attempts=ext_ok?state.attempts:0,quiet=ext_ok?state.quiet_ms:0;
@@ -199,10 +205,22 @@ static void draw(int pinmode,const char*pin,int digit){
  unsigned pulse=(l==BT_LINK_CONNECTING||l==BT_LINK_SEARCHING)?150+(unsigned)((t/6)%100):255;
  disc(px+26,70,6,col,pulse>255?255:pulse);
  text(F_SMALLB,px+44,77,pill,mixc(TEXT,col,90));
+ {
+  char vtag[96];uint32_t vcol=CARD2,vtc=SUBTLE;
+  if(upd_state==BTA_UPD_OUTDATED&&upd_latest[0]){
+   if(upd_has_pkg)snprintf(vtag,sizeof(vtag),"v%s -> %s (R2 Update)",BTA_VERSION,upd_latest);
+   else snprintf(vtag,sizeof(vtag),"v%s -> %s (Update)",BTA_VERSION,upd_latest);
+   vcol=mixc(CARD,AMBER,40);vtc=AMBER;
+  }
+  else if(upd_state==BTA_UPD_MISMATCH&&upd_latest[0]){snprintf(vtag,sizeof(vtag),"v%s (latest %s - mismatch)",BTA_VERSION,upd_latest);vcol=mixc(CARD,BLUE,36);vtc=BLUE;}
+  else snprintf(vtag,sizeof(vtag),"v%s",BTA_VERSION);
+  int vx=146+text_w(F_TITLE,"Bluetooth Audio")+14,max_vw=px-16-vx;
+  if(max_vw>40){int vw=text_w(F_SMALLB,vtag)+24;if(vw>max_vw)vw=max_vw;rrect(vx,46,vw,30,15,vcol);text_fit(F_SMALLB,vx+12,68,vtag,vtc,vw-24);}
+ }
 
  /* status strip: the one place problems are spelled out */
  const char*msg=state.message;char full[TBUF];
- int has_banner=1;uint32_t bc=AMBER;int spin=0;const char*btext=0;
+ int has_banner=1,show_upd_btn=0;uint32_t bc=AMBER;int spin=0;const char*btext=0;
  if(notice[0]&&g_now<notice_until){bc=AMBER;btext=notice;}
  else if(l==UI_OFFLINE){bc=RED;btext="The audio service isn't running. Press X to start it, or jailbreak again with GoldHEN's BinLoader enabled.";}
  else if(l==BT_LINK_LOST||l==BT_LINK_FAILED){bc=RED;
@@ -210,11 +228,21 @@ static void draw(int pinmode,const char*pin,int digit){
  else if(l==BT_LINK_CONNECTING){bc=AMBER;spin=1;btext=msg;}
  else if(l==BT_LINK_SEARCHING){bc=BLUE;spin=1;btext=msg;}
  else if(l==BT_LINK_STREAMING&&quiet>4000){bc=AMBER;btext="Connected, waiting for sound from the PS4. Play something or press Options to test.";}
+ else if(upd_state==BTA_UPD_OUTDATED&&upd_latest[0]){bc=AMBER;show_upd_btn=upd_has_pkg;snprintf(full,sizeof(full),"New release %s is available (you have v%s). Please update as soon as possible, as it may include bug fixes.",upd_latest,BTA_VERSION);btext=full;}
+ else if(upd_state==BTA_UPD_MISMATCH&&upd_latest[0]){bc=BLUE;snprintf(full,sizeof(full),"Version mismatch: you have v%s, while the latest release is %s. You can safely ignore this.",BTA_VERSION,upd_latest);btext=full;}
  else has_banner=0;
  if(has_banner){
   rrect(56,124,1168,72,16,mixc(CARD,bc,30));rrect(56,124,6,72,3,bc);
   if(spin)spinner(98,160,14,bc,t,8,3);else{disc(98,160,17,bc,255);icon_c(I_BANG,98,160,BG_TOP,255);}
-  int nl=wrap2(F_BODY,btext,1168-100-28,buf,buf2);
+  int bmax=1168-100-28;
+  if(show_upd_btn){
+   int r2w=text_w(F_SMALLB,"R2")+18,lblw=text_w(F_SMALLB,"Download"),bw=r2w+lblw+36,bx=1224-bw-18;
+   rrect(bx,140,bw,40,20,mixc(CARD,AMBER,60));
+   rrect(bx+10,147,r2w,26,8,CARD2);text(F_SMALLB,bx+19,167,"R2",AMBER);
+   text(F_SMALLB,bx+10+r2w+8,167,"Download",TEXT);
+   bmax-=bw+24;
+  }
+  int nl=wrap2(F_BODY,btext,bmax,buf,buf2);
   if(nl==1)text(F_BODY,130,168,buf,TEXT);else{text(F_BODY,130,154,buf,TEXT);text(F_BODY,130,182,buf2,TEXT);}
  }else{
   disc(70,160,5,col,255);
@@ -336,5 +364,48 @@ static void draw(int pinmode,const char*pin,int digit){
    char tch[2]={pin[i],0};text_c(F_TITLE,bx+46,400,tch,i==digit?BG_TOP:TEXT,80);
   }
   text_c(F_SMALL,640,480,"Left/Right: digit    Up/Down: change    X: submit    O: cancel",FAINT,540);
+ }else if(dl_state!=BTA_DL_NONE){
+  dim_frame(165);
+  uint32_t bar_c=dl_state==BTA_DL_DONE?MINT:(dl_state==BTA_DL_ERROR?RED:AMBER);
+  rrect(240,155,800,410,24,0x1b2a40);rrect(240,155,800,6,3,bar_c);
+  if(dl_state==BTA_DL_RUNNING){
+   spinner(640,220,16,AMBER,t,10,3);
+   text_c(F_TITLE,640,278,"Downloading Update",TEXT,720);
+   snprintf(buf,sizeof(buf),"Saving %s to /data/pkg/",dl_pkg_name[0]?dl_pkg_name:"package");
+   text_c(F_BODY,640,318,buf,DIM,720);
+   rrect(310,358,660,20,10,LINE);
+   if(dl_total>0){
+    uint64_t pct=(dl_bytes*100)/dl_total;if(pct>100)pct=100;
+    int fw=(int)(660*pct/100);if(fw>0&&fw<20)fw=20;
+    if(fw>0)rrect(310,358,fw,20,10,MINT);
+    char b1[32],b2[32];fmt_bytes(dl_bytes,b1,sizeof(b1));fmt_bytes(dl_total,b2,sizeof(b2));
+    snprintf(buf,sizeof(buf),"%llu%%   (%s / %s)",(unsigned long long)pct,b1,b2);
+   }else{
+    int sw=150,sx=310+(int)((t/4)%(uint64_t)(660-sw));
+    rrect(sx,358,sw,20,10,MINT);
+    char b1[32];fmt_bytes(dl_bytes,b1,sizeof(b1));
+    snprintf(buf,sizeof(buf),"%s downloaded...",b1);
+   }
+   text_c(F_BODY,640,414,buf,TEXT,720);
+   text_c(F_SMALL,640,518,"Press O to cancel download",FAINT,720);
+  }else if(dl_state==BTA_DL_DONE){
+   disc(640,218,22,MINT,255);icon_c(I_CHECK,640,218,BG_TOP,255);
+   text_c(F_TITLE,640,282,"Update Ready to Install",TEXT,720);
+   snprintf(buf,sizeof(buf),"Saved to /data/pkg/%s",dl_pkg_name);
+   text_c(F_BODY,640,318,buf,MINT,720);
+   rrect(284,344,712,138,16,CARD2);
+   int nl=wrap2(F_SMALL,"1. Press O to close BTAudio4, then delete the old app from the home screen.",672,buf,buf2);
+   if(nl==1)text(F_SMALL,304,378,buf,TEXT);else{text(F_SMALL,304,372,buf,TEXT);text(F_SMALL,304,398,buf2,TEXT);}
+   snprintf(full,sizeof(full),"2. Open GoldHEN -> Debug Settings -> Package Installer and install %s.",dl_pkg_name);
+   nl=wrap2(F_SMALL,full,672,buf,buf2);
+   if(nl==1)text(F_SMALL,304,434,buf,TEXT);else{text(F_SMALL,304,428,buf,TEXT);text(F_SMALL,304,454,buf2,TEXT);}
+   text_c(F_SMALL,640,524,"Press X or O to dismiss",FAINT,720);
+  }else{
+   disc(640,218,22,RED,255);icon_c(I_XMARK,640,218,BG_TOP,255);
+   text_c(F_TITLE,640,282,"Download Failed",TEXT,720);
+   int nl=wrap2(F_BODY,dl_err[0]?dl_err:"Could not download the update package.",680,buf,buf2);
+   if(nl==1)text_c(F_BODY,640,348,buf,DIM,680);else{text_c(F_BODY,640,336,buf,DIM,680);text_c(F_BODY,640,368,buf2,DIM,680);}
+   text_c(F_SMALL,640,520,"Press X or O to dismiss    (Press R2 to retry)",FAINT,720);
+  }
  }
 }

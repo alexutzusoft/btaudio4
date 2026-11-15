@@ -5,7 +5,11 @@ $clang = Join-Path $workspace 'toolchain/llvm/bin/clang.exe'
 $linker = Join-Path $workspace 'toolchain/llvm/bin/ld.lld.exe'
 $build = Join-Path $root 'build/bta-app'
 New-Item -ItemType Directory -Force -Path $build | Out-Null
-$html = [IO.File]::ReadAllBytes((Join-Path $root 'src/payload/web.html'))
+$verMatch = [regex]::Match((Get-Content -Raw (Join-Path $root 'src/version.h')), '#define\s+BTA_VERSION\s+"([^"]+)"')
+if (-not $verMatch.Success) { throw 'Could not parse BTA_VERSION from src/version.h' }
+$ver = $verMatch.Groups[1].Value
+$htmlText = [IO.File]::ReadAllText((Join-Path $root 'src/payload/web.html'), [Text.Encoding]::UTF8).Replace('__BTA_VERSION__', $ver)
+$html = [Text.Encoding]::UTF8.GetBytes($htmlText)
 $array = ($html | ForEach-Object { $_.ToString() }) -join ','
 [IO.File]::WriteAllText((Join-Path $build 'web_page.h'), "static const char web_page[] = {$array,0};")
 $flags = @('--target=x86_64-pc-freebsd12-elf','-O2','-fPIE','-ffreestanding','-fno-builtin','-fno-stack-protector','-mno-red-zone','-fno-asynchronous-unwind-tables','-Wall','-Wextra','-Werror','-I', $build)
@@ -33,6 +37,6 @@ $objects += $obj
 $script = Join-Path $root 'src/payload/payload.ld'
 & $linker -T $script @objects -o (Join-Path $build 'BTA-Audio.debug.elf')
 if ($LASTEXITCODE) { throw 'ELF link failed' }
-& $linker --oformat=binary -T $script @objects -o (Join-Path $root 'build/BTAudio4-1.4.0.bin')
+& $linker --oformat=binary -T $script @objects -o (Join-Path $root "build/BTAudio4-$ver.bin")
 if ($LASTEXITCODE) { throw 'Binary link failed' }
-Write-Output 'Built build/BTAudio4-1.4.0.bin'
+Write-Output "Built build/BTAudio4-$ver.bin"

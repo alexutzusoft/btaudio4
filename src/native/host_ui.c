@@ -31,6 +31,14 @@ static void apply(const char*k,const char*v){
  else if(!strcmp(k,"t"))g_now=(uint64_t)atoll(v)*1000u;
  else if(!strcmp(k,"meter_s"))meter_s=atoi(v);
  else if(!strcmp(k,"notice")){snprintf(notice,sizeof(notice),"%s",v);}
+ else if(!strcmp(k,"upd_state"))upd_state=atoi(v);
+ else if(!strcmp(k,"upd_latest")){snprintf(upd_latest,sizeof(upd_latest),"%s",v);}
+ else if(!strcmp(k,"upd_has_pkg"))upd_has_pkg=atoi(v);
+ else if(!strcmp(k,"dl_state"))dl_state=atoi(v);
+ else if(!strcmp(k,"dl_bytes"))dl_bytes=(uint64_t)strtoull(v,0,10);
+ else if(!strcmp(k,"dl_total"))dl_total=(uint64_t)strtoull(v,0,10);
+ else if(!strcmp(k,"dl_pkg_name")){snprintf(dl_pkg_name,sizeof(dl_pkg_name),"%s",v);}
+ else if(!strcmp(k,"dl_err")){snprintf(dl_err,sizeof(dl_err),"%s",v);}
  else if(!strcmp(k,"pin"))pinmode=atoi(v);
  else if(!strcmp(k,"pin_text"))snprintf(pin_text,sizeof(pin_text),"%s",v);
  else if(!strcmp(k,"pin_digit"))pin_digit=atoi(v);

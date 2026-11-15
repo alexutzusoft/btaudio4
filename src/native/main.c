@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -12,6 +13,10 @@
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
 #include <orbis/SystemService.h>
+#include <orbis/Sysmodule.h>
+#include <orbis/Net.h>
+#include <orbis/Ssl.h>
+#include <orbis/Http.h>
 #include "ui.h"
 
 static int pad=-1,pad_connected;
@@ -190,8 +195,299 @@ static void snapshot(void){
  }
  sceKernelClose(fd);logline("snapshot: written");
 }
+
+static int g_upd_active,g_upd_ready,g_upd_result;
+static char g_upd_latest[64],g_upd_log[160],g_upd_pkg_name[128],g_upd_pkg_url[512],last_upd_log[160];
+static uint64_t g_upd_pkg_size;
+
+static int g_dl_active,g_dl_state,g_dl_cancel,g_dl_finished,dl_modal_dismissed;
+static uint64_t g_dl_bytes,g_dl_total;
+static char g_dl_err[160],g_dl_log[160],g_dl_pkg_name[128],g_dl_pkg_url[512];
+
+static int32_t skip_ssl_cb(int32_t libssl_id,uint32_t verify_err,void*const ssl_cert[],int32_t cert_num,void*user_arg){
+ (void)libssl_id;(void)verify_err;(void)ssl_cert;(void)cert_num;(void)user_arg;
+ return 1;
+}
+
+struct http_ctx{int net_id,ssl_id,http_id,tpl;};
+
+static int open_http_ctx(struct http_ctx*ctx,const char*pool_name,uint32_t timeout_us,char*err,size_t err_cap){
+ ctx->net_id=ctx->ssl_id=ctx->http_id=ctx->tpl=-1;
+ if(sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_NET)<0||
+    sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_HTTP)<0||
+    sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_SSL)<0){
+  snprintf(err,err_cap,"sysmodule load failed");
+  return -1;
+ }
+ sceNetInit();
+ ctx->net_id=sceNetPoolCreate(pool_name,16*1024,0);
+ if(ctx->net_id<0){snprintf(err,err_cap,"sceNetPoolCreate=0x%x",ctx->net_id);return -1;}
+ ctx->ssl_id=sceSslInit(SSL_POOLSIZE);
+ if(ctx->ssl_id<0){snprintf(err,err_cap,"sceSslInit=0x%x",ctx->ssl_id);return -1;}
+ ctx->http_id=sceHttpInit(ctx->net_id,ctx->ssl_id,LIBHTTP_POOLSIZE);
+ if(ctx->http_id<0){snprintf(err,err_cap,"sceHttpInit=0x%x",ctx->http_id);return -1;}
+ ctx->tpl=sceHttpCreateTemplate(ctx->http_id,"BTAudio4/" BTA_VERSION,ORBIS_HTTP_VERSION_1_1,1);
+ if(ctx->tpl<0){snprintf(err,err_cap,"template=0x%x",ctx->tpl);return -1;}
+ sceHttpSetResolveTimeOut(ctx->tpl,timeout_us);
+ sceHttpSetConnectTimeOut(ctx->tpl,timeout_us);
+ sceHttpSetSendTimeOut(ctx->tpl,timeout_us);
+ sceHttpsSetSslCallback(ctx->tpl,skip_ssl_cb,0);
+ return 0;
+}
+
+static void close_http_ctx(struct http_ctx*ctx){
+ if(ctx->tpl>=0)sceHttpDeleteTemplate(ctx->tpl);
+ if(ctx->http_id>=0)sceHttpTerm(ctx->http_id);
+ if(ctx->ssl_id>=0)sceSslTerm(ctx->ssl_id);
+ if(ctx->net_id>=0)sceNetPoolDestroy(ctx->net_id);
+ ctx->net_id=ctx->ssl_id=ctx->http_id=ctx->tpl=-1;
+}
+
+static int http_get_follow(int tpl,const char*start_url,const char*accept_hdr,int*conn_out,int*req_out,int32_t*status_out,char*err,size_t err_cap){
+ char url[1024];
+ snprintf(url,sizeof(url),"%s",start_url);
+ *conn_out=-1;*req_out=-1;*status_out=0;
+
+ for(int hop=0;hop<6;hop++){
+  int conn=sceHttpCreateConnectionWithURL(tpl,url,0);
+  if(conn<0){snprintf(err,err_cap,"Connection failed (0x%x)",conn);return -1;}
+  int req=sceHttpCreateRequestWithURL(conn,ORBIS_METHOD_GET,url,0);
+  if(req<0){sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Request failed (0x%x)",req);return -1;}
+  if(accept_hdr)sceHttpAddRequestHeader(req,"Accept",accept_hdr,0);
+
+  int rc=sceHttpSendRequest(req,0,0);
+  if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Send failed (0x%x)",rc);return -1;}
+  int32_t code=0;
+  rc=sceHttpGetStatusCode(req,&code);
+  if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Status read failed (0x%x)",rc);return -1;}
+
+  if(code==301||code==302||code==303||code==307||code==308){
+   char*hdrs=0;size_t hlen=0;char next_url[1024];
+   int hrc=sceHttpGetAllResponseHeaders(req,&hdrs,&hlen);
+   int got=(hrc>=0&&hdrs&&bta_extract_location_header(hdrs,hlen,next_url,sizeof(next_url))==0);
+   sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);
+   if(!got){snprintf(err,err_cap,"Redirect missing Location header");return -1;}
+   snprintf(url,sizeof(url),"%s",next_url);
+   continue;
+  }
+
+  *conn_out=conn;*req_out=req;*status_out=code;
+  return 0;
+ }
+ snprintf(err,err_cap,"Too many redirects");
+ return -1;
+}
+
+static void*update_check_thread(void*arg){
+ (void)arg;
+ int res=BTA_UPD_NONE;
+ struct http_ctx ctx;
+ int conn=-1,req=-1;
+ char*buf=0;
+ char err[128]={0};
+ g_upd_latest[0]=0;
+ g_upd_log[0]=0;
+ g_upd_pkg_name[0]=0;
+ g_upd_pkg_url[0]=0;
+ g_upd_pkg_size=0;
+
+ if(open_http_ctx(&ctx,"bta_upd",5000000,err,sizeof(err))<0){
+  snprintf(g_upd_log,sizeof(g_upd_log),"update: %s",err);
+  goto done;
+ }
+
+ int32_t status_code=0;
+ if(http_get_follow(ctx.tpl,BTA_GITHUB_LATEST_URL,"application/vnd.github+json",&conn,&req,&status_code,err,sizeof(err))<0){
+  snprintf(g_upd_log,sizeof(g_upd_log),"update: %s",err);
+  goto done;
+ }
+ if(status_code!=200){snprintf(g_upd_log,sizeof(g_upd_log),"update: http=%d",(int)status_code);goto done;}
+
+ buf=malloc(65536);
+ if(!buf){snprintf(g_upd_log,sizeof(g_upd_log),"update: oom");goto done;}
+ size_t total=0;
+ while(total+1<65536){
+  int n=sceHttpReadData(req,buf+total,(uint32_t)(65535-total));
+  if(n<=0)break;
+  total+=(size_t)n;
+ }
+ buf[total]=0;
+
+ char tag[64];
+ if(bta_extract_tag_name(buf,total,tag,sizeof(tag))<0){
+  snprintf(g_upd_log,sizeof(g_upd_log),"update: tag_name missing (%zu bytes)",total);
+  goto done;
+ }
+ bta_format_v(tag,g_upd_latest,sizeof(g_upd_latest));
+ int cmp=bta_compare_versions(tag,BTA_VERSION);
+ if(cmp>0){
+  res=BTA_UPD_OUTDATED;
+  unsigned long long psz=0;
+  bta_extract_pkg_asset(buf,total,g_upd_pkg_name,sizeof(g_upd_pkg_name),g_upd_pkg_url,sizeof(g_upd_pkg_url),&psz);
+  g_upd_pkg_size=(uint64_t)psz;
+ }else if(cmp==-1)res=BTA_UPD_MISMATCH;
+ else if(cmp==0)res=BTA_UPD_LATEST;
+ snprintf(g_upd_log,sizeof(g_upd_log),"update: current=v%s latest=%s state=%d pkg=%s",BTA_VERSION,g_upd_latest,res,g_upd_pkg_name[0]?g_upd_pkg_name:"none");
+
+done:
+ free(buf);
+ if(req>=0)sceHttpDeleteRequest(req);
+ if(conn>=0)sceHttpDeleteConnection(conn);
+ close_http_ctx(&ctx);
+ g_upd_result=res;
+ __atomic_store_n(&g_upd_ready,1,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_upd_active,0,__ATOMIC_RELEASE);
+ return 0;
+}
+
+static void start_update_check(void){
+ if(__atomic_load_n(&g_upd_active,__ATOMIC_ACQUIRE)||__atomic_load_n(&g_dl_active,__ATOMIC_ACQUIRE))return;
+ __atomic_store_n(&g_upd_ready,0,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_upd_active,1,__ATOMIC_RELEASE);
+ OrbisPthread th=0;
+ int rc=scePthreadCreate(&th,0,update_check_thread,0,"BTAudio4Update");
+ if(rc==0)scePthreadDetach(th);
+ else{__atomic_store_n(&g_upd_active,0,__ATOMIC_RELEASE);logline("update: thread start failed");}
+}
+
+static void*pkg_download_thread(void*arg){
+ (void)arg;
+ struct http_ctx ctx;
+ int conn=-1,req=-1,fd=-1,final_state=BTA_DL_ERROR;
+ char*chunk=0;
+ char tmp_path[256],final_path[256],err[160]={0};
+ snprintf(tmp_path,sizeof(tmp_path),"/data/pkg/%s.part",g_dl_pkg_name);
+ snprintf(final_path,sizeof(final_path),"/data/pkg/%s",g_dl_pkg_name);
+ g_dl_err[0]=0;
+ g_dl_log[0]=0;
+
+ if(open_http_ctx(&ctx,"bta_dl",10000000,err,sizeof(err))<0){
+  snprintf(g_dl_err,sizeof(g_dl_err),"Network initialization failed (%s).",err);
+  goto done;
+ }
+
+ int32_t status_code=0;
+ if(http_get_follow(ctx.tpl,g_dl_pkg_url,0,&conn,&req,&status_code,err,sizeof(err))<0){
+  snprintf(g_dl_err,sizeof(g_dl_err),"Could not connect to GitHub (%s).",err);
+  goto done;
+ }
+ if(status_code!=200){
+  snprintf(g_dl_err,sizeof(g_dl_err),"GitHub returned HTTP %d.",(int)status_code);
+  goto done;
+ }
+
+ int len_type=0;uint64_t content_len=0;
+ if(sceHttpGetResponseContentLength(req,&len_type,&content_len)>=0&&len_type==ORBIS_HTTP_CONTENTLEN_EXIST&&content_len>0){
+  __atomic_store_n(&g_dl_total,content_len,__ATOMIC_RELAXED);
+ }
+
+ sceKernelMkdir("/data/pkg",0777);
+ fd=sceKernelOpen(tmp_path,0x601,0644);
+ if(fd<0){
+  snprintf(g_dl_err,sizeof(g_dl_err),"Could not create %s (0x%x).",tmp_path,fd);
+  goto done;
+ }
+
+ chunk=malloc(32768);
+ if(!chunk){snprintf(g_dl_err,sizeof(g_dl_err),"Out of memory.");goto done;}
+
+ uint64_t written=0;
+ int cancelled=0,read_err=0,write_err=0;
+ for(;;){
+  if(__atomic_load_n(&g_dl_cancel,__ATOMIC_ACQUIRE)){cancelled=1;break;}
+  int n=sceHttpReadData(req,chunk,32768);
+  if(n<0){read_err=n;break;}
+  if(n==0)break;
+  size_t off=0;
+  while(off<(size_t)n){
+   ssize_t w=(ssize_t)sceKernelWrite(fd,chunk+off,(size_t)n-off);
+   if(w<=0){write_err=(int)w;break;}
+   off+=(size_t)w;
+  }
+  if(write_err)break;
+  written+=(uint64_t)n;
+  __atomic_store_n(&g_dl_bytes,written,__ATOMIC_RELAXED);
+ }
+
+ sceKernelClose(fd);fd=-1;
+ if(cancelled){
+  sceKernelUnlink(tmp_path);
+  final_state=BTA_DL_NONE;
+  snprintf(g_dl_log,sizeof(g_dl_log),"download: cancelled");
+  goto done;
+ }
+ if(read_err<0){
+  sceKernelUnlink(tmp_path);
+  snprintf(g_dl_err,sizeof(g_dl_err),"Download interrupted (0x%x).",read_err);
+  goto done;
+ }
+ if(write_err){
+  sceKernelUnlink(tmp_path);
+  snprintf(g_dl_err,sizeof(g_dl_err),"Disk write failed (%d).",write_err);
+  goto done;
+ }
+ if(written<1024||(len_type==ORBIS_HTTP_CONTENTLEN_EXIST&&content_len>0&&written!=content_len)){
+  sceKernelUnlink(tmp_path);
+  snprintf(g_dl_err,sizeof(g_dl_err),"Incomplete package downloaded (%llu bytes).",(unsigned long long)written);
+  goto done;
+ }
+
+ sceKernelUnlink(final_path);
+ int rrc=sceKernelRename(tmp_path,final_path);
+ if(rrc<0){
+  sceKernelUnlink(tmp_path);
+  snprintf(g_dl_err,sizeof(g_dl_err),"Could not save %s (0x%x).",final_path,rrc);
+  goto done;
+ }
+
+ final_state=BTA_DL_DONE;
+ snprintf(g_dl_log,sizeof(g_dl_log),"download: saved %s (%llu bytes)",final_path,(unsigned long long)written);
+
+done:
+ if(fd>=0){sceKernelClose(fd);sceKernelUnlink(tmp_path);}
+ free(chunk);
+ if(req>=0)sceHttpDeleteRequest(req);
+ if(conn>=0)sceHttpDeleteConnection(conn);
+ close_http_ctx(&ctx);
+ if(final_state==BTA_DL_ERROR&&!g_dl_log[0])snprintf(g_dl_log,sizeof(g_dl_log),"download: error: %s",g_dl_err);
+ __atomic_store_n(&g_dl_state,final_state,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_dl_finished,1,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_dl_active,0,__ATOMIC_RELEASE);
+ return 0;
+}
+
+static void start_pkg_download(void){
+ if(!g_upd_pkg_url[0]||!g_upd_pkg_name[0])return;
+ if(__atomic_load_n(&g_dl_active,__ATOMIC_ACQUIRE))return;
+ dl_modal_dismissed=0;
+ snprintf(g_dl_pkg_name,sizeof(g_dl_pkg_name),"%s",g_upd_pkg_name);
+ snprintf(g_dl_pkg_url,sizeof(g_dl_pkg_url),"%s",g_upd_pkg_url);
+ __atomic_store_n(&g_dl_cancel,0,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_dl_finished,0,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_dl_bytes,0,__ATOMIC_RELAXED);
+ __atomic_store_n(&g_dl_total,g_upd_pkg_size,__ATOMIC_RELAXED);
+ __atomic_store_n(&g_dl_state,BTA_DL_RUNNING,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_dl_active,1,__ATOMIC_RELEASE);
+ snprintf(dl_pkg_name,sizeof(dl_pkg_name),"%s",g_upd_pkg_name);
+ dl_bytes=0;
+ dl_total=g_upd_pkg_size;
+ dl_err[0]=0;
+ dl_state=BTA_DL_RUNNING;
+
+ OrbisPthread th=0;
+ int rc=scePthreadCreate(&th,0,pkg_download_thread,0,"BTAudio4Download");
+ if(rc==0){scePthreadDetach(th);logline("download: started");}
+ else{
+  __atomic_store_n(&g_dl_active,0,__ATOMIC_RELEASE);
+  __atomic_store_n(&g_dl_state,BTA_DL_ERROR,__ATOMIC_RELEASE);
+  snprintf(dl_err,sizeof(dl_err),"Could not start download thread (0x%x).",rc);
+  dl_state=BTA_DL_ERROR;
+  logline("download: thread start failed");
+ }
+}
+
 int main(void){
- sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);log_rotate();g_start=sceKernelGetProcessTime();g_now=g_start;logline("BTAudio4 1.4.0 native app starting");
+ sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);log_rotate();g_start=sceKernelGetProcessTime();g_now=g_start;logline("BTAudio4 " BTA_VERSION " native app starting");
  int video=sceVideoOutOpen(0xff,0,0,0);if(video<0){logline("VideoOutOpen failed");return 1;}
  off_t memory;size_t size=8*1024*1024;void*base=0;
  if(sceKernelAllocateDirectMemory(0,sceKernelGetDirectMemorySize(),size,0x200000,3,&memory)<0||sceKernelMapDirectMemory(&base,size,0x33,0,memory,0x200000)<0){logline("Video memory failed");return 2;}
@@ -204,11 +500,32 @@ int main(void){
  char diag[128];snprintf(diag,sizeof(diag),"User init=0x%x Pad init=0x%x",user_rc,pad_rc);logline(diag);
  sceSystemServiceHideSplashScreen();
  logline("Checking audio service");service_check();start_service();
+ start_update_check();
  logline("Starting display loop");
  focus=0;for(int i=0;i<state.count;i++)if(state.devices[i].address==state.selected)focus=i;
- unsigned previous=0;int buffer=0,armed=0;long flip=0;uint64_t poll=0,repeat=0,first_draw=0,snap_cd=0;int pinmode=0,pinignore=0,digit=0,auto_snapped=0;char pin[5]="0000";
+ unsigned previous=0;int buffer=0,armed=0;long flip=0;uint64_t poll=0,repeat=0,first_draw=0,snap_cd=0,next_upd=sceKernelGetProcessTime()+60000000ULL;int pinmode=0,pinignore=0,digit=0,auto_snapped=0;char pin[5]="0000";
  for(;;){
   uint64_t now=sceKernelGetProcessTime();g_now=now;
+  if(now>=next_upd){next_upd=now+60000000ULL;start_update_check();}
+  if(__atomic_exchange_n(&g_upd_ready,0,__ATOMIC_ACQ_REL)){
+   if(g_upd_result!=BTA_UPD_NONE){
+    snprintf(upd_latest,sizeof(upd_latest),"%s",g_upd_latest);
+    upd_state=g_upd_result;
+    upd_has_pkg=(g_upd_pkg_url[0]!=0);
+    if(g_upd_pkg_name[0]&&!__atomic_load_n(&g_dl_active,__ATOMIC_ACQUIRE))snprintf(dl_pkg_name,sizeof(dl_pkg_name),"%s",g_upd_pkg_name);
+   }
+   if(g_upd_log[0]&&strcmp(g_upd_log,last_upd_log)!=0){snprintf(last_upd_log,sizeof(last_upd_log),"%s",g_upd_log);logline(g_upd_log);}
+  }
+  if(!dl_modal_dismissed&&(__atomic_load_n(&g_dl_active,__ATOMIC_ACQUIRE)||__atomic_load_n(&g_dl_finished,__ATOMIC_ACQUIRE))){
+   dl_bytes=__atomic_load_n(&g_dl_bytes,__ATOMIC_RELAXED);
+   dl_total=__atomic_load_n(&g_dl_total,__ATOMIC_RELAXED);
+   dl_state=__atomic_load_n(&g_dl_state,__ATOMIC_ACQUIRE);
+  }
+  if(__atomic_exchange_n(&g_dl_finished,0,__ATOMIC_ACQ_REL)){
+   snprintf(dl_err,sizeof(dl_err),"%s",g_dl_err);
+   if(!dl_modal_dismissed)dl_state=__atomic_load_n(&g_dl_state,__ATOMIC_ACQUIRE);
+   if(g_dl_log[0])logline(g_dl_log);
+  }
   int l=ui_link();
   if(now>=poll){refresh();poll=now+(!online?2000000:(l==BT_LINK_STREAMING?300000:500000));}
   if(!state.pin_pending)pinignore=0;if(state.pin_pending&&!pinmode&&!pinignore){pinmode=1;digit=0;memcpy(pin,"0000",5);}
@@ -226,8 +543,15 @@ int main(void){
    if(pressed&ORBIS_PAD_BUTTON_UP)pin[digit]=(char)('0'+(pin[digit]-'0'+1)%10);if(pressed&ORBIS_PAD_BUTTON_DOWN)pin[digit]=(char)('0'+(pin[digit]-'0'+9)%10);
    if(pressed&ORBIS_PAD_BUTTON_CIRCLE){pinmode=0;pinignore=1;}
    if(pressed&ORBIS_PAD_BUTTON_CROSS){char path[40];snprintf(path,sizeof(path),"/api/pin/%s",pin);logline("action: pin");action(path);pinmode=0;pinignore=1;}
+  }else if(dl_state==BTA_DL_RUNNING){
+   if(pressed&ORBIS_PAD_BUTTON_CIRCLE){__atomic_store_n(&g_dl_cancel,1,__ATOMIC_RELEASE);dl_state=BTA_DL_NONE;dl_modal_dismissed=1;logline("download: cancel requested");}
+  }else if(dl_state==BTA_DL_DONE||dl_state==BTA_DL_ERROR){
+   int prev_dl=dl_state;
+   if(pressed&(ORBIS_PAD_BUTTON_CROSS|ORBIS_PAD_BUTTON_CIRCLE)){dl_state=BTA_DL_NONE;dl_modal_dismissed=1;}
+   else if(prev_dl==BTA_DL_ERROR&&(pressed&ORBIS_PAD_BUTTON_R2)){start_pkg_download();}
   }else{
    if(pressed&ORBIS_PAD_BUTTON_CIRCLE)break;
+   if((pressed&ORBIS_PAD_BUTTON_R2)&&upd_state==BTA_UPD_OUTDATED&&upd_has_pkg){start_pkg_download();}
    if(state.count>0){
     if(pressed&ORBIS_PAD_BUTTON_DOWN)focus=(focus+1)%state.count;
     if(pressed&ORBIS_PAD_BUTTON_UP)focus=(focus+state.count-1)%state.count;

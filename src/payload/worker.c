@@ -2,6 +2,7 @@
 #include "web_page.h"
 #include "protocol.h"
 #include "kresolve.h"
+#include "../version.h"
 int bta_apply_patch(void);
 
 #define WORKER_LOG "/data/bta_audio/worker.log"
@@ -442,7 +443,7 @@ static int retry_in_ms(struct app*a,u64 now){return(a->wanted&&!a->streaming&&!a
 static int quiet_for_ms(struct app*a,u64 now){if(!a->streaming||now<a->ok_at)return 0;u64 ms=(now-a->ok_at)/1000;return ms>2000000000UL?2000000000:(int)ms;}
 static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
- struct writer w={out,0,cap};append(&w,"{\"version\":\"1.4.0\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
+ struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",a->sender_prio);field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
  field(&w,"volume",a->volume);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
@@ -463,7 +464,7 @@ static unsigned native_status(struct app*a,char*out){struct bt_native*n=(void*)o
  return sizeof(*n);}
 static void response(struct client*c,const char*code,const char*type,const char*body,unsigned n){
  struct writer w={c->output,0,sizeof(c->output)};append(&w,"HTTP/1.1 ");append(&w,code);append(&w,"\r\nContent-Type: ");append(&w,type);append(&w,"\r\nContent-Length: ");number(&w,n);
- append(&w,"\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\n\r\n");
+ append(&w,"\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; connect-src 'self' https://api.github.com; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\n\r\n");
  if(w.used+n>sizeof(c->output)){c->total=0;return;}memcpy(c->output+w.used,body,n);c->total=w.used+n;
 }
 static char*header(char*request,const char*name){
@@ -611,7 +612,7 @@ void*bta_worker(void*arg){
   struct{u64 size;char text[28];unsigned version;}sw={.size=40};int(*getver)(void*)=0;unsigned swv=0;
   if(!resolve("sceKernelGetSystemSwVersion",&getver)&&getver&&!getver(&sw)){sw.text[27]=0;swv=sw.version;}
   if(wlog_begin(&a,t0,"worker_start")){
-   wlog_raw(&a,"v=1.4.0 fw=");wlog_str(&a,swv?sw.text:"unknown");wlog_raw(&a," fw_hex=");wlog_hex(&a,swv);
+   wlog_raw(&a,"v=" BTA_VERSION " fw=");wlog_str(&a,swv?sw.text:"unknown");wlog_raw(&a," fw_hex=");wlog_hex(&a,swv);
    wlog_raw(&a," hdmi_fd=");wlog_dec(&a,a.hdmi);wlog_raw(&a," tv=");wlog_dec(&a,a.tv);
    wlog_raw(&a," vol=");wlog_dec(&a,a.volume);wlog_raw(&a," joint=");wlog_dec(&a,a.joint);
    wlog_raw(&a," no_widen=");wlog_dec(&a,a.no_widen);
