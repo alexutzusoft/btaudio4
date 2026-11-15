@@ -2,7 +2,7 @@
 
 Homebrew for a **jailbroken PS4** running GoldHEN. Sends game audio from the console's built-in Bluetooth radio straight to Bluetooth Classic headphones—no dongle or PC in the audio path. Output only (no microphone).
 
-> **Experimental.** Discovers kernel symbols and patch offsets dynamically at runtime instead of using hardcoded firmware tables (verifies unique kernel instruction signatures before patching and aborts cleanly on mismatches). Patches live in RAM only and disappear on reboot. **Only tested on firmware v14.02 so far, with more coming soon.**
+> **Experimental.** Discovers kernel symbols and patch offsets dynamically at runtime instead of using hardcoded firmware tables (verifies unique kernel instruction signatures before patching and aborts cleanly on mismatches). Patches live in RAM only and disappear on reboot. **Tested on firmware v12.50, v13.52, and v14.02.**
 
 ## Install
 
