@@ -577,5 +577,14 @@ int main(void){
   for(int tries=0;tries<1000;tries++){OrbisVideoOutFlipStatus status;if(!sceVideoOutGetFlipStatus(video,&status)&&status.flipArg==flip)break;sceKernelUsleep(1000);}
   buffer^=1;flip++;
  }
- logline("Native app closed; audio service remains running");if(pad>=0)scePadClose(pad);sceVideoOutClose(video);return 0;
+ logline("Native app closed; audio service remains running");
+ if(pad>=0)scePadClose(pad);
+ sceVideoOutUnregisterBuffers(video,0);
+ sceVideoOutClose(video);
+ sceKernelMunmap(base,size);
+ sceKernelReleaseDirectMemory(memory,size);
+ int exit_rc=sceSystemServiceLoadExec("exit",0);
+ if(exit_rc>=0){for(;;)sceKernelUsleep(100000);}
+ {char msg[64];snprintf(msg,sizeof(msg),"exit failed: sceSystemServiceLoadExec=0x%x",exit_rc);logline(msg);}
+ return 0;
 }
