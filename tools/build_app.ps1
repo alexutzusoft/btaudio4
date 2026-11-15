@@ -33,6 +33,6 @@ $objects += $obj
 $script = Join-Path $root 'src/payload/payload.ld'
 & $linker -T $script @objects -o (Join-Path $build 'BTA-Audio.debug.elf')
 if ($LASTEXITCODE) { throw 'ELF link failed' }
-& $linker --oformat=binary -T $script @objects -o (Join-Path $root 'build/BTAudio4-1.3.0.bin')
+& $linker --oformat=binary -T $script @objects -o (Join-Path $root 'build/BTAudio4-1.4.0.bin')
 if ($LASTEXITCODE) { throw 'Binary link failed' }
-Write-Output 'Built build/BTAudio4-1.3.0.bin'
+Write-Output 'Built build/BTAudio4-1.4.0.bin'

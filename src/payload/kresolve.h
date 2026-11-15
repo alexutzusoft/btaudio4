@@ -30,6 +30,8 @@ struct bt_koff {
     u32 conn_state_off;
     u32 conn_policy_off;
     u32 conn_handle_off;
+    u64 accept_site;
+    u64 fail_stage;
 };
 
 u64 kr_find_base(void);

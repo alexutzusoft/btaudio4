@@ -23,6 +23,7 @@ struct input {
     int mode;
     const struct bt_koff *k;
     struct bt_devices *out;
+    struct bt_prep_diag *diag;
 };
 struct args {
     void *fn;
@@ -41,10 +42,12 @@ static int resolve_cb(void *td, struct resolve_args *a) {
     u64 base = kr_find_base();
     if (!base) return 101;
     struct bt_koff res;
-    if (kr_resolve_bt(base, &res) || !res.copyout_fn) return 102;
+    int bad = kr_resolve_bt(base, &res);
+    if (!res.copyout_fn) return 102;
     if (*(const u32 *)res.copyout_fn != 0xe5894855U) return 103;
     int (*copyout)(const void *, void *, u64) = (void *)res.copyout_fn;
-    return copyout(&res, a->out, sizeof(res));
+    int cprc = copyout(&res, a->out, sizeof(res));
+    return bad ? 102 : cprc;
 }
 
 static int callback(void *td, struct args *a) {
@@ -100,27 +103,47 @@ static int callback(void *td, struct args *a) {
             }
         }
     } else {
+        struct bt_prep_diag d_out;
+        zero_mem(&d_out, sizeof(d_out));
         rc = 2;
         for (unsigned off = k->conn_off; off < k->conn_end; off += k->conn_stride) {
             unsigned char *c = ctx + off;
             if (*(u64 *)(c + 0x30) != address) continue;
             unsigned char *d = *(void **)(c + k->conn_dev_off);
-            if (!d || ((u64)d >> 48) != 0xffff || !(*(unsigned *)(d + 0x20) & 8)) {
+            d_out.conn_state = *(unsigned *)(c + k->conn_state_off);
+            d_out.conn_policy = *(unsigned *)(c + k->conn_policy_off);
+            d_out.handle = *(unsigned short *)(c + k->conn_handle_off);
+            if (!d || ((u64)d >> 48) != 0xffff) {
                 rc = 93;
                 break;
             }
-            if (*(unsigned *)(c + k->conn_state_off) >= 3) {
+            d_out.dev_services = *(unsigned *)(d + 0x20);
+            if (!(d_out.dev_services & 8)) {
+                rc = 93;
+                break;
+            }
+            if (d_out.conn_state >= 3) {
+                d_out.skipped = 1;
                 rc = 0;
                 break;
             }
             int (*command)(void *, unsigned, const char *, ...) = (void *)k->cmd_fn;
-            rc = command(ctx, 0x40f, (const char *)k->fmt_str, (unsigned)*(unsigned short *)(c + k->conn_handle_off), 0x3c18);
+            rc = command(ctx, 0x40f, (const char *)k->fmt_str, (unsigned)d_out.handle, 0x3c18);
             if (rc >= 0) {
                 *(unsigned *)(c + k->conn_policy_off) = 0x3c18;
+                d_out.conn_policy = 0x3c18;
                 rc = 0;
             }
             break;
         }
+        d_out.rc = rc;
+        unlock(0);
+        if (in->diag) {
+            int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
+            int cprc = copyout(&d_out, in->diag, sizeof(d_out));
+            if (cprc && !rc) rc = cprc;
+        }
+        return rc;
     }
 
     unlock(0);
@@ -145,7 +168,15 @@ int bt_list(struct bt_devices *out) {
     return invoke(&in);
 }
 
-int bt_prepare(u64 address) {
-    struct input in = {.address = address, .mode = 1};
+int bt_prepare_diag(u64 address, struct bt_prep_diag *diag) {
+    struct input in = {.address = address, .mode = 1, .diag = diag};
     return invoke(&in);
+}
+
+int bt_prepare(u64 address) {
+    return bt_prepare_diag(address, 0);
+}
+
+const struct bt_koff *bt_koff_info(void) {
+    return &g_koff;
 }

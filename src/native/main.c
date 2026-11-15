@@ -15,18 +15,37 @@
 #include "ui.h"
 
 static int pad=-1,pad_connected;
-static uint64_t pad_retry;
+static uint64_t pad_retry,g_start,last_launch_try;
 
 /* All file I/O uses sceKernel* (never stdio): the app runs in a restricted
  * sandbox where a blocked libc syscall raises SIGSYS. app.log confirms these
  * kernel calls succeed. */
 static void logline(const char*s){
+ uint64_t now=sceKernelGetProcessTime();
+ if(!g_start)g_start=now;
+ uint64_t t=(now>=g_start?(now-g_start):0)/100000;
+ char buf[320];
+ int n=snprintf(buf,sizeof(buf),"[+%llu.%llus] %s\n",(unsigned long long)(t/10),(unsigned long long)(t%10),s);
+ if(n<=0)return;
+ if(n>(int)sizeof(buf))n=(int)sizeof(buf);
  int fd=sceKernelOpen("/data/bta_audio/app.log",0x209,0644);
- if(fd>=0){sceKernelWrite(fd,s,strlen(s));sceKernelWrite(fd,"\n",1);sceKernelClose(fd);}
+ if(fd>=0){sceKernelWrite(fd,buf,(size_t)n);sceKernelClose(fd);}
+}
+static void log_rotate(void){
+ int fd=sceKernelOpen("/data/bta_audio/app.log",0,0);
+ if(fd<0)return;
+ off_t sz=sceKernelLseek(fd,0,2);
+ sceKernelClose(fd);
+ if(sz>=131072)sceKernelRename("/data/bta_audio/app.log","/data/bta_audio/app.prev.log");
 }
 static unsigned controller(uint64_t now){
  OrbisPadData data;memset(&data,0,sizeof(data));
- if(pad>=0){int rc=scePadReadState(pad,&data);if(rc>=0&&data.connected){pad_connected=1;return data.buttons;}pad_connected=0;}
+ if(pad>=0){
+  int rc=scePadReadState(pad,&data);
+  if(rc>=0&&data.connected){pad_connected=1;return data.buttons;}
+  if(pad_connected){char msg[96];snprintf(msg,sizeof(msg),"Controller disconnected (rc=0x%x connected=%d)",rc,(int)data.connected);logline(msg);}
+  pad_connected=0;
+ }
  if(now<pad_retry)return 0;pad_retry=now+2000000;
  if(pad>=0){scePadClose(pad);pad=-1;}
  OrbisUserServiceLoginUserIdList users;for(int i=0;i<4;i++)users.userId[i]=-1;
@@ -68,25 +87,43 @@ static int http(const char*method,const char*path,void*out,size_t cap){
 }
 /* Reads /api/native. Older services send a shorter reply without the link fields;
  * those are accepted (ext_ok=0) and the UI falls back to the basic flags. */
+static int prev_online=-1,prev_link=-1,prev_streaming=-1,prev_conn_rc=0,prev_audio_rc=0;
+static void log_service_change(void){
+ if(online!=prev_online){
+  prev_online=online;
+  if(!online){logline("service: offline (port 8097 unreachable)");prev_link=-1;return;}
+  char msg[128];snprintf(msg,sizeof(msg),"service: online ext_ok=%d count=%d selected=%012lX",ext_ok,state.count,state.selected);
+  logline(msg);
+ }
+ if(!online)return;
+ int l=ui_link();
+ if(l!=prev_link||state.streaming!=prev_streaming||state.connect_rc!=prev_conn_rc||(state.audio_rc<0&&state.audio_rc!=prev_audio_rc)){
+  prev_link=l;prev_streaming=state.streaming;prev_conn_rc=state.connect_rc;prev_audio_rc=state.audio_rc;
+  char msg[260];
+  snprintf(msg,sizeof(msg),"state: link=%d streaming=%d attempts=%d connect_rc=%d audio_rc=%d msg=\"%.110s\"",
+   l,state.streaming,state.attempts,state.connect_rc,state.audio_rc,state.message);
+  logline(msg);
+ }
+}
 static int refresh(void){
  struct bt_native next;memset(&next,0,sizeof(next));
- int fd=local_socket(8097);if(fd<0){online=0;return -1;}
+ int fd=local_socket(8097);if(fd<0){online=0;log_service_change();return -1;}
  const char*req="GET /api/native HTTP/1.1\r\nHost: 127.0.0.1:8097\r\nConnection: close\r\n\r\n";
- if(write_all(fd,req,strlen(req))){close(fd);online=0;return -1;}
+ if(write_all(fd,req,strlen(req))){close(fd);online=0;log_service_change();return -1;}
  char resp[8192];size_t used=0;
  while(used<sizeof(resp)){ssize_t n=recv(fd,resp+used,sizeof(resp)-used,0);if(n<=0)break;used+=(size_t)n;}
  close(fd);
- if(used<12||strncmp(resp,"HTTP/1.1 200",12)){online=0;return -1;}
+ if(used<12||strncmp(resp,"HTTP/1.1 200",12)){online=0;log_service_change();return -1;}
  char*body=0;for(size_t i=0;i+3<used;i++)if(resp[i]=='\r'&&resp[i+1]=='\n'&&resp[i+2]=='\r'&&resp[i+3]=='\n'){body=resp+i+4;break;}
  size_t avail=body?(size_t)(resp+used-body):0;
- if(!body||avail<offsetof(struct bt_native,link)){online=0;return -1;}
+ if(!body||avail<offsetof(struct bt_native,link)){online=0;log_service_change();return -1;}
  memcpy(&next,body,avail<sizeof(next)?avail:sizeof(next));
- if(next.magic!=BT_NATIVE_MAGIC||next.version!=2||next.count<0||next.count>BT_DEVICE_LIMIT){online=0;return -1;}
+ if(next.magic!=BT_NATIVE_MAGIC||next.version!=2||next.count<0||next.count>BT_DEVICE_LIMIT){online=0;log_service_change();return -1;}
  unsigned long selected=(focus>=0&&focus<state.count)?state.devices[focus].address:0;
  state=next;ext_ok=avail>=sizeof(next);state.message[127]=0;for(int i=0;i<state.count;i++)state.devices[i].name[95]=0;
  if(selected){for(int i=0;i<state.count;i++)if(state.devices[i].address==selected)focus=i;}
  if(focus<0||focus>=state.count)focus=0;
- online=1;return 0;
+ online=1;log_service_change();return 0;
 }
 static void set_notice(const char*s){snprintf(notice,sizeof(notice),"%s",s);notice_until=g_now+6000000;}
 /* The audio service normally starts at boot (GoldHEN AutoRun). If it is not running
@@ -96,7 +133,7 @@ static void set_notice(const char*s){snprintf(notice,sizeof(notice),"%s",s);noti
 static void service_check(void){refresh();}
 static int launch_attempted;
 static void start_service(void){
- if(online||launch_attempted)return;launch_attempted=1;
+ if(online||launch_attempted)return;launch_attempted=1;last_launch_try=g_now;
  static char payload[131072];
  int f=sceKernelOpen("/app0/assets/BTA-Audio.bin",0,0);
  if(f<0){logline("start: bundled payload not found");return;}
@@ -107,14 +144,20 @@ static void start_service(void){
  int fd=local_socket(9090);
  if(fd<0){logline("start: BinLoader (9090) not reachable; enable it in GoldHEN and jailbreak again");return;}
  int rc=write_all(fd,payload,used);close(fd);
- logline(rc?"start: send failed":"start: payload sent to BinLoader");
+ {char msg[128];snprintf(msg,sizeof(msg),rc?"start: send failed (%zu bytes)":"start: payload sent to BinLoader (%zu bytes)",used);logline(msg);}
  if(!rc)set_notice("Starting audio service...");
 }
 static void action(const char*path){
  char body[160];int code=http("POST",path,body,sizeof(body));
  if(code==200)notice[0]=0;
- else if(code<0)set_notice("No response from the audio service.");
- else{for(int i=0;body[i];i++)if(body[i]=='\n'||body[i]=='\r')body[i]=0;set_notice(body[0]?body:"That didn't work.");}
+ else if(code<0){
+  char msg[160];snprintf(msg,sizeof(msg),"http: POST %.80s failed (transport)",path);logline(msg);
+  set_notice("No response from the audio service.");
+ }else{
+  for(int i=0;body[i];i++)if(body[i]=='\n'||body[i]=='\r')body[i]=0;
+  char msg[240];snprintf(msg,sizeof(msg),"http: POST %.60s -> %d %.100s",path,code,body);logline(msg);
+  set_notice(body[0]?body:"That didn't work.");
+ }
  refresh();
 }
 static void volume_change(int amount){
@@ -122,7 +165,14 @@ static void volume_change(int amount){
  char path[40];snprintf(path,sizeof(path),"/api/volume/%d",value);action(path);
 }
 static void activate(void){
- if(!online){launch_attempted=0;service_check();start_service();return;}
+ if(!online){
+  if(last_launch_try&&g_now-last_launch_try<5000000){
+   logline("activate: BinLoader retry skipped (cooldown; BinLoader may only accept 1 payload per jailbreak)");
+   set_notice("Service offline. Wait a moment or re-enable BinLoader.");
+   return;
+  }
+  launch_attempted=0;service_check();start_service();return;
+ }
  if(state.count<=0||focus<0||focus>=state.count)return;
  const struct bt_device*d=&state.devices[focus];int l=ui_link();
  if(d->address==state.selected&&l!=BT_LINK_IDLE){action("/api/stop");return;}
@@ -141,7 +191,7 @@ static void snapshot(void){
  sceKernelClose(fd);logline("snapshot: written");
 }
 int main(void){
- sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);logline("BTAudio4 1.3.0 native app starting");
+ sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);log_rotate();g_start=sceKernelGetProcessTime();g_now=g_start;logline("BTAudio4 1.4.0 native app starting");
  int video=sceVideoOutOpen(0xff,0,0,0);if(video<0){logline("VideoOutOpen failed");return 1;}
  off_t memory;size_t size=8*1024*1024;void*base=0;
  if(sceKernelAllocateDirectMemory(0,sceKernelGetDirectMemorySize(),size,0x200000,3,&memory)<0||sceKernelMapDirectMemory(&base,size,0x33,0,memory,0x200000)<0){logline("Video memory failed");return 2;}
@@ -183,9 +233,9 @@ int main(void){
     if(pressed&ORBIS_PAD_BUTTON_UP)focus=(focus+state.count-1)%state.count;
    }
    if(pressed&ORBIS_PAD_BUTTON_CROSS){logline("action: connect/disconnect");activate();}
-   if(pressed&ORBIS_PAD_BUTTON_TRIANGLE){if(online&&l!=BT_LINK_IDLE){logline("action: disconnect");action("/api/stop");}else{logline("action: scan");action("/api/scan");}}
-   if(pressed&ORBIS_PAD_BUTTON_SQUARE){logline("action: tv");action(state.tv?"/api/tv-off":"/api/tv-on");}
-   if(pressed&ORBIS_PAD_BUTTON_OPTIONS){logline("action: test sound");action("/api/test");if(!notice[0])testing_until=g_now+2200000;}
+   if(pressed&ORBIS_PAD_BUTTON_TRIANGLE){if(!online){logline("action: scan ignored (service offline)");}else if(l!=BT_LINK_IDLE){logline("action: disconnect");action("/api/stop");}else{logline("action: scan");action("/api/scan");}}
+   if(pressed&ORBIS_PAD_BUTTON_SQUARE){if(!online){logline("action: tv ignored (service offline)");}else{logline("action: tv");action(state.tv?"/api/tv-off":"/api/tv-on");}}
+   if(pressed&ORBIS_PAD_BUTTON_OPTIONS){if(!online){logline("action: test ignored (service offline)");}else{logline("action: test sound");action("/api/test");if(!notice[0])testing_until=g_now+2200000;}}
    if(pressed&(ORBIS_PAD_BUTTON_L1|ORBIS_PAD_BUTTON_LEFT))volume_change(-5);
    if(pressed&(ORBIS_PAD_BUTTON_R1|ORBIS_PAD_BUTTON_RIGHT))volume_change(5);
   }

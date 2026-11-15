@@ -24,6 +24,14 @@ struct bt_native { unsigned magic,version; int streaming,wanted,tv,muted,scannin
  int connect_rc,audio_rc; /* last driver results; 0 = fine */
 };
 static inline int bt_is_audio(const struct bt_device*d){return (d->services&8)||(((d->cod>>8)&31)==4&&!(d->services&0x40));}
+struct bt_prep_diag {
+ int rc,skipped;
+ unsigned conn_state,conn_policy,dev_services;
+ unsigned short handle,reserved;
+};
+struct bt_koff;
 int bt_list(struct bt_devices*);
 int bt_prepare(unsigned long address);
+int bt_prepare_diag(unsigned long address, struct bt_prep_diag *diag);
+const struct bt_koff *bt_koff_info(void);
 #endif

@@ -371,7 +371,7 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     for (u64 i = 0; i < sizeof(*out); i++) ((volatile u8 *)out)[i] = 0;
 
     u64 rx_start = 0, rx_len = 0;
-    if (kr_rx_bounds(base, &rx_start, &rx_len)) return -1;
+    if (kr_rx_bounds(base, &rx_start, &rx_len)) { out->fail_stage = 1; return -1; }
 
     struct kr_range ro[4];
     u32 n_ro = kr_ro_ranges(base, ro, 4);
@@ -379,10 +379,11 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
 
     out->base = base;
     out->copyout_fn = kr_resolve_copyout(rx_start, rx_len);
-    if (!out->copyout_fn) return -1;
+    if (!out->copyout_fn) { out->fail_stage = 2; return -1; }
 
     u64 site = kr_resolve_accept_site(rx_start, rx_len);
-    if (!site) return -1;
+    if (!site) { out->fail_stage = 3; return -1; }
+    out->accept_site = site;
 
     u64 rx_end = rx_start + rx_len;
     u64 bt_start = (site > rx_start + 0x60000UL) ? (site - 0x60000UL) : rx_start;
@@ -402,15 +403,15 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     out->conn_handle_off = 0x48;
 
     out->lock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_lock");
-    if (!out->lock_fn) return -1;
+    if (!out->lock_fn) { out->fail_stage = 4; return -1; }
 
     out->unlock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_unlock");
-    if (!out->unlock_fn) return -1;
+    if (!out->unlock_fn) { out->fail_stage = 5; return -1; }
 
-    if (resolve_cmd_and_fmt(bt_start, bt_len, out)) return -1;
-    if (resolve_cache_and_bounds(bt_start, bt_len, out)) return -1;
+    if (resolve_cmd_and_fmt(bt_start, bt_len, out)) { out->fail_stage = 6; return -1; }
+    if (resolve_cache_and_bounds(bt_start, bt_len, out)) { out->fail_stage = 7; return -1; }
     out->ctx_ptr = resolve_ctx_ptr(bt_start, bt_len, ro, n_ro);
-    if (!out->ctx_ptr) return -1;
+    if (!out->ctx_ptr) { out->fail_stage = 8; return -1; }
 
     out->valid = 1;
     return 0;
