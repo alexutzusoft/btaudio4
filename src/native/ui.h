@@ -394,11 +394,13 @@ static void draw(int pinmode,const char*pin,int digit){
    snprintf(buf,sizeof(buf),"Saved to /data/pkg/%s",dl_pkg_name);
    text_c(F_BODY,640,318,buf,MINT,720);
    rrect(284,344,712,138,16,CARD2);
-   int nl=wrap2(F_SMALL,"1. Press O to close BTAudio4, then delete the old app from the home screen.",672,buf,buf2);
-   if(nl==1)text(F_SMALL,304,378,buf,TEXT);else{text(F_SMALL,304,372,buf,TEXT);text(F_SMALL,304,398,buf2,TEXT);}
-   snprintf(full,sizeof(full),"2. Open GoldHEN -> Debug Settings -> Package Installer and install %s.",dl_pkg_name);
-   nl=wrap2(F_SMALL,full,672,buf,buf2);
-   if(nl==1)text(F_SMALL,304,434,buf,TEXT);else{text(F_SMALL,304,428,buf,TEXT);text(F_SMALL,304,454,buf2,TEXT);}
+   text(F_SMALL,304,366,"1. Close BTAudio4 from the PS4 home screen.",TEXT);
+   text(F_SMALL,304,388,"2. Open GoldHEN -> Debug Settings -> Package Installer.",TEXT);
+   snprintf(full,sizeof(full),"Select %s.",dl_pkg_name);
+   int nl=wrap2(F_SMALL,full,652,buf,buf2);
+   text(F_SMALL,324,410,buf,TEXT);
+   if(nl>1)text(F_SMALL,324,432,buf2,TEXT);
+   text(F_SMALL,304,454,"3. If asked \"Do you want to continue installing?\", select Yes.",TEXT);
    text_c(F_SMALL,640,524,"Press X or O to dismiss",FAINT,720);
   }else{
    disc(640,218,22,RED,255);icon_c(I_XMARK,640,218,BG_TOP,255);
