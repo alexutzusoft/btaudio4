@@ -1,4 +1,4 @@
-# PS4 Bluetooth Audio (theoretically supports **all** firmwares)
+# PS4 Bluetooth Audio (**any** firmware)
 
 Homebrew for a **jailbroken PS4** running GoldHEN. Sends game audio from the console's built-in Bluetooth radio straight to Bluetooth Classic headphones—no dongle or PC in the audio path. Output only (no microphone).
 
