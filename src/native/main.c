@@ -16,7 +16,10 @@
 #include <orbis/Sysmodule.h>
 #include <orbis/Net.h>
 #include <orbis/Ssl.h>
+#define sceHttpSetResponseHeaderMaxSize sceHttpSetResponseHeaderMaxSize_stub
 #include <orbis/Http.h>
+#undef sceHttpSetResponseHeaderMaxSize
+int32_t sceHttpSetResponseHeaderMaxSize(int32_t id,size_t headerSize);
 #include "ui.h"
 
 static int pad=-1,pad_connected;
@@ -231,6 +234,7 @@ static int open_http_ctx(struct http_ctx*ctx,const char*pool_name,uint32_t timeo
  sceHttpSetResolveTimeOut(ctx->tpl,timeout_us);
  sceHttpSetConnectTimeOut(ctx->tpl,timeout_us);
  sceHttpSetSendTimeOut(ctx->tpl,timeout_us);
+ sceHttpSetResponseHeaderMaxSize(ctx->tpl,16384);
  sceHttpsSetSslCallback(ctx->tpl,skip_ssl_cb,0);
  return 0;
 }
@@ -244,7 +248,7 @@ static void close_http_ctx(struct http_ctx*ctx){
 }
 
 static int http_get_follow(int tpl,const char*start_url,const char*accept_hdr,int*conn_out,int*req_out,int32_t*status_out,char*err,size_t err_cap){
- char url[1024];
+ char url[2048];
  snprintf(url,sizeof(url),"%s",start_url);
  *conn_out=-1;*req_out=-1;*status_out=0;
 
@@ -253,7 +257,7 @@ static int http_get_follow(int tpl,const char*start_url,const char*accept_hdr,in
   if(conn<0){snprintf(err,err_cap,"Connection failed (0x%x)",conn);return -1;}
   int req=sceHttpCreateRequestWithURL(conn,ORBIS_METHOD_GET,url,0);
   if(req<0){sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Request failed (0x%x)",req);return -1;}
-  if(accept_hdr)sceHttpAddRequestHeader(req,"Accept",accept_hdr,0);
+  if(accept_hdr&&strncmp(url,"https://api.github.com/",23)==0)sceHttpAddRequestHeader(req,"Accept",accept_hdr,0);
 
   int rc=sceHttpSendRequest(req,0,0);
   if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Send failed (0x%x)",rc);return -1;}
@@ -262,7 +266,7 @@ static int http_get_follow(int tpl,const char*start_url,const char*accept_hdr,in
   if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Status read failed (0x%x)",rc);return -1;}
 
   if(code==301||code==302||code==303||code==307||code==308){
-   char*hdrs=0;size_t hlen=0;char next_url[1024];
+   char*hdrs=0;size_t hlen=0;char next_url[2048];
    int hrc=sceHttpGetAllResponseHeaders(req,&hdrs,&hlen);
    int got=(hrc>=0&&hdrs&&bta_extract_location_header(hdrs,hlen,next_url,sizeof(next_url))==0);
    sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);
@@ -367,7 +371,7 @@ static void*pkg_download_thread(void*arg){
  }
 
  int32_t status_code=0;
- if(http_get_follow(ctx.tpl,g_dl_pkg_url,0,&conn,&req,&status_code,err,sizeof(err))<0){
+ if(http_get_follow(ctx.tpl,g_dl_pkg_url,"application/octet-stream",&conn,&req,&status_code,err,sizeof(err))<0){
   snprintf(g_dl_err,sizeof(g_dl_err),"Could not connect to GitHub (%s).",err);
   goto done;
  }

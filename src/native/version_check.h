@@ -203,7 +203,7 @@ static inline int bta_extract_pkg_asset(const char *json, size_t len,
     *size_out = 0;
 
     int depth = 0, in_assets = 0, assets_depth = 0;
-    char cur_name[128] = {0}, cur_url[512] = {0};
+    char cur_name[128] = {0}, cur_url[512] = {0}, cur_api_url[512] = {0};
     unsigned long long cur_size = 0;
 
     size_t i = 0;
@@ -239,6 +239,10 @@ static inline int bta_extract_pkg_asset(const char *json, size_t len,
                         bta_read_json_str(json, len, &j, cur_name, sizeof(cur_name));
                         i = j;
                         continue;
+                    } else if (kl == 3 && memcmp(json + ks, "url", 3) == 0 && j < len && json[j] == '"') {
+                        bta_read_json_str(json, len, &j, cur_api_url, sizeof(cur_api_url));
+                        i = j;
+                        continue;
                     } else if (kl == 20 && memcmp(json + ks, "browser_download_url", 20) == 0 && j < len && json[j] == '"') {
                         bta_read_json_str(json, len, &j, cur_url, sizeof(cur_url));
                         i = j;
@@ -262,14 +266,17 @@ static inline int bta_extract_pkg_asset(const char *json, size_t len,
             if (in_assets && c == '{' && depth == assets_depth + 1) {
                 cur_name[0] = 0;
                 cur_url[0] = 0;
+                cur_api_url[0] = 0;
                 cur_size = 0;
             }
         } else if (c == '}' || c == ']') {
             if (in_assets && c == '}' && depth == assets_depth + 1) {
+                /* Prefer GitHub's API asset url (small 302 headers) over github.com (huge CSP header). */
+                const char *chosen_url = (strncmp(cur_api_url, "https://", 8) == 0) ? cur_api_url : cur_url;
                 if (bta_safe_filename(cur_name) && bta_ends_with_ci(cur_name, ".pkg") &&
-                    strncmp(cur_url, "https://", 8) == 0) {
+                    strncmp(chosen_url, "https://", 8) == 0) {
                     snprintf(name_out, name_cap, "%s", cur_name);
-                    snprintf(url_out, url_cap, "%s", cur_url);
+                    snprintf(url_out, url_cap, "%s", chosen_url);
                     *size_out = cur_size;
                     return 0;
                 }
