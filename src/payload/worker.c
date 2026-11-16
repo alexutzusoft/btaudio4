@@ -18,11 +18,11 @@ static const short SINE32[32]={0,1561,3061,4445,5657,6652,7391,7846,8000,7846,73
 
 struct audio_req{u64 address;void*samples;u64 length;u32 mode,pad;};
 struct client{long fd;u64 deadline;u32 used,sent,total;char input[2048];char output[20000];};
-struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak;};
+struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak,rc_full,rc_one,rc_other,maxref_ms;};
 enum audio_fault{AUDIO_OK,AUDIO_RING_RESET,AUDIO_RELINK,AUDIO_LINK_LOST};
 struct audio_stats{
  u64 packets,errors,resyncs,ok_at,refused_since;
- long last_rc;
+ long last_rc,other_rc;
  unsigned level,meter_peak;
 };
 /* The mutex protects this stream and its snapshots only. The worker owns the
@@ -39,12 +39,15 @@ struct audio_stream{
  int refused_warned,err_warned,relink_limit;
  unsigned refused_ms,refused_backlog;
  long error_rc;u64 error_count;
+ short pending_pcm[384];
+ unsigned pending_peak;
+ int has_pending,was_testing;
 };
 struct app{
  int(*sleep)(unsigned);u64(*clock)(void);int(*shm)(const char*,int,int);
  void*(*map)(void*,u64,int,int,int,u64);int(*unmap)(void*,u64);
  long listener,bt,hdmi,shmfd;u8*ring;int wanted,streaming,tv,muted,quit,phase;
- long patch_rc,packet_rc,connect_rc,last_rc,hdmi_rc,btstate,list_rc;
+ long patch_rc,packet_rc,connect_rc,last_rc,other_rc,hdmi_rc,btstate,list_rc;
  u64 next_try,deadline,scan_at,heartbeat,poll_at,net_at,packets,errors,resyncs;
  int net_poll_failed;
  unsigned level;int volume;char message[128];
@@ -101,7 +104,7 @@ static void sync_audio_controls(struct app*a){
 }
 static void copy_audio_stats(struct app*a,const struct audio_stats*s){
  a->packets=s->packets;a->errors=s->errors;a->resyncs=s->resyncs;
- a->ok_at=s->ok_at;a->refused_since=s->refused_since;a->last_rc=s->last_rc;
+ a->ok_at=s->ok_at;a->refused_since=s->refused_since;a->last_rc=s->last_rc;a->other_rc=s->other_rc;
  a->level=s->level;a->meter_peak=s->meter_peak;
 }
 __attribute__((noinline)) static void wlog_raw(struct app*a,const char*s){while(*s&&a->logused+1<sizeof(a->logbuf))a->logbuf[a->logused++]=*s++;a->logbuf[a->logused]=0;}
@@ -322,18 +325,26 @@ static void start_audio(struct app*a){
  int was_dropped=a->dropped,told=a->announced,fresh=!a->session;
  a->attempts=0;a->failed=0;a->dropped=0;a->announced=0;a->session=1;a->ok_at=a->stream_at;a->meter=0;a->meter_peak=0;
  if(wlog_begin(a,a->stream_at,"audio_start")){
+  unsigned peers=0,hid=0;
+  for(unsigned i=0;i<a->devices.count;i++){
+   const struct bt_device*d=&a->devices.items[i];
+   if(d->address==a->target.address)continue;
+   peers++;
+   if((d->services&0x40)||(((d->cod>>8)&31)==5))hid++;
+  }
   wlog_raw(a,"mac=");wlog_mac(a,a->target.address);wlog_raw(a," name=");wlog_str(a,target_name(a));
   wlog_raw(a," joint=");wlog_dec(a,a->joint);wlog_raw(a," tv=");wlog_dec(a,a->tv);
-  wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_raw(a," readpos=");wlog_dec(a,(long)readpos);wlog_end(a,1);
+  wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_raw(a," readpos=");wlog_dec(a,(long)readpos);
+  wlog_raw(a," peers=");wlog_dec(a,(long)peers);wlog_raw(a," hid=");wlog_dec(a,(long)hid);wlog_end(a,1);
  }
  say(a,"Connected to ",a->tv?". TV sound is on.":". TV sound is muted.");
  lock_state(a);
  struct audio_stream*s=&a->audio;
  s->ring=a->ring;s->bt=a->bt;s->address=a->target.address;s->readpos=readpos;
  s->volume=a->volume;s->joint=a->joint;s->test_until=s->test_next=s->last_send=0;s->test_phase=0;
- s->stats.errors=s->stats.refused_since=s->stats.level=s->stats.meter_peak=0;s->stats.ok_at=a->stream_at;
+ s->stats.errors=s->stats.refused_since=s->stats.level=s->stats.meter_peak=0;s->stats.other_rc=0;s->stats.ok_at=a->stream_at;
  s->fault=AUDIO_OK;s->resync_backlog=0;s->refused_warned=s->err_warned=s->relink_limit=0;
- s->refused_ms=0;s->error_count=0;s->active=1;
+ s->refused_ms=0;s->error_count=0;s->has_pending=0;s->was_testing=0;s->pending_peak=0;s->active=1;
  wake_audio(a);
  unlock_state(a);
  if(was_dropped){if(told&&may_announce(a,2))notify("Bluetooth headphones reconnected.");}
@@ -401,6 +412,9 @@ __attribute__((noinline)) static void wlog_stream_summary(struct app*a,u64 now,c
   wlog_raw(a," late16=");wlog_dec(a,(long)s->late16);wlog_raw(a," late50=");wlog_dec(a,(long)s->late50);
   wlog_raw(a," maxgap_us=");wlog_dec(a,(long)s->maxgap_us);wlog_raw(a," maxsend_us=");wlog_dec(a,(long)s->maxsend_us);
   wlog_raw(a," maxback_ms=");wlog_dec(a,(long)s->maxback_ms);wlog_raw(a," audio_rc=");wlog_dec(a,a->last_rc);
+  wlog_raw(a," rc768=");wlog_dec(a,(long)s->rc_full);wlog_raw(a," rc1=");wlog_dec(a,(long)s->rc_one);
+  if(s->rc_other){wlog_raw(a," rc_oth=");wlog_dec(a,(long)s->rc_other);wlog_raw(a," last_oth=");wlog_dec(a,a->other_rc);}
+  if(s->maxref_ms){wlog_raw(a," maxref_ms=");wlog_dec(a,(long)s->maxref_ms);}
   if(s->refused)wlog_raw(a," [BT_QUEUE_REFUSED]");
   if(resync_d)wlog_raw(a," [RING_OVERFLOW_DROP]");
   if(s->late50||s->late16)wlog_raw(a," [SENDER_STALLED]");
@@ -413,6 +427,8 @@ static void roll_second(struct app*a,u64 now){
   a->cur.seq=++a->sec_seq;a->secs[a->sec_seq%128]=a->cur;
   a->health.pkts+=a->cur.pkts;a->health.refused+=a->cur.refused;a->health.failed+=a->cur.failed;
   a->health.late8+=a->cur.late8;a->health.late16+=a->cur.late16;a->health.late50+=a->cur.late50;
+  a->health.rc_full+=a->cur.rc_full;a->health.rc_one+=a->cur.rc_one;a->health.rc_other+=a->cur.rc_other;
+  if(a->cur.maxref_ms>a->health.maxref_ms)a->health.maxref_ms=a->cur.maxref_ms;
   if(a->cur.maxgap_us>a->health.maxgap_us)a->health.maxgap_us=a->cur.maxgap_us;
   if(a->cur.maxsend_us>a->health.maxsend_us)a->health.maxsend_us=a->cur.maxsend_us;
   if(a->cur.maxback_ms>a->health.maxback_ms)a->health.maxback_ms=a->cur.maxback_ms;
@@ -449,16 +465,22 @@ static void joint_path(u64 address,char out[40]){
  out[i]=0;
 }
 static void load_joint(struct app*a){char p[40];joint_path(a->target.address,p);a->joint=!(a->target.address&&exists(p));}
+static u32 ring_back_cursor(u32 writepos,u32 bytes){
+ u32 off=writepos-16;
+ off=(off>=bytes)?(off-bytes):(off+0xfff0U-bytes);
+ return 16+off;
+}
 /* Called with the stream mutex held. The driver submission can block, so
  * release it across the ioctl while keeping the current stream pinned. */
 static unsigned audio_tick(struct app*a,u64 now){
  struct audio_stream*s=&a->audio;
  struct audio_stats*st=&s->stats;
- short pcm[384];unsigned peak=0;unsigned backlog=0;
+ short pcm[384];unsigned peak=0;unsigned backlog=0;unsigned rem=0;
  if(now<s->test_until){
   /* Self-paced test tone (works even with no game audio): one 192-frame packet
    * every ~4ms. Independent of the capture ring; follows the volume slider
    * (50% = the old fixed level, 100% = about half of full scale). */
+  s->was_testing=1;s->has_pending=0;
   if(now<s->test_next){
    u64 due=s->test_next<s->test_until?s->test_next:s->test_until;
    return (unsigned)(due-now);
@@ -474,28 +496,42 @@ static unsigned audio_tick(struct app*a,u64 now){
   if(writepos<16||writepos>=0x10000||(writepos&7)){
    s->bad_writepos=writepos;s->fault=AUDIO_RING_RESET;return 0;
   }
+  /* Resync after test tone so 2s of unconsumed game audio does not overflow. */
+  if(s->was_testing){s->was_testing=0;s->has_pending=0;s->readpos=writepos;}
   unsigned available=writepos>=s->readpos?writepos-s->readpos:0xfff0-s->readpos+writepos;
   if(available>0xc000){
-   s->readpos=writepos;st->resyncs++;s->resync_backlog=available;
-   return 500;
+   s->readpos=ring_back_cursor(writepos,6144U);s->has_pending=0;st->resyncs++;s->resync_backlog=available;
+   return 0;
   }
-  if(available<1536){
-   /* Use the 48 kHz stereo float rate to estimate the next block. Cap the
-    * wait because the capture producer can publish several frames at once. */
-   unsigned wait=(1536-available)*1000/384;
-   return wait<500?500:wait>2000?2000:wait;
+  if(s->has_pending){
+   /* Retry the packet refused by the driver instead of dropping 4ms of audio. */
+   memcpy(pcm,s->pending_pcm,sizeof(pcm));
+   peak=s->pending_peak;
+   backlog=available+1536;
+   rem=available;
+  }else{
+   if(available<1536){
+    /* Use the 48 kHz stereo float rate to estimate the next block. Cap the
+     * wait because the capture producer can publish several frames at once. */
+    unsigned wait=(1536-available)*1000/384;
+    return wait<500?500:wait>2000?2000:wait;
+   }
+   backlog=available;
+   rem=available-1536;
+   u32 cursor=s->readpos;
+   float gain=32767.0f*(float)s->volume/100.0f;
+   for(unsigned i=0;i<384;i++){
+    float f=*(const volatile float*)(s->ring+cursor);
+    cursor+=4;if(cursor==0x10000)cursor=16;
+    if(f!=f)f=0;if(f>1)f=1;if(f<-1)f=-1;
+    int v=(int)(f*gain);pcm[i]=(short)v;
+    unsigned m=v<0?-v:v;if(m>peak)peak=m;
+   }
+   s->readpos=cursor;
+   memcpy(s->pending_pcm,pcm,sizeof(pcm));
+   s->pending_peak=peak;
+   s->has_pending=1;
   }
-  backlog=available;
-  u32 cursor=s->readpos;
-  float gain=32767.0f*(float)s->volume/100.0f;
-  for(unsigned i=0;i<384;i++){
-   float f=*(const volatile float*)(s->ring+cursor);
-   cursor+=4;if(cursor==0x10000)cursor=16;
-   if(f!=f)f=0;if(f>1)f=1;if(f<-1)f=-1;
-   int v=(int)(f*gain);pcm[i]=(short)v;
-   unsigned m=v<0?-v:v;if(m>peak)peak=m;
-  }
-  s->readpos=cursor;
  }
  struct audio_req req={s->address,pcm,sizeof(pcm),s->joint?4:3,0};
  long bt=s->bt;
@@ -521,20 +557,29 @@ static unsigned audio_tick(struct app*a,u64 now){
  if(rc==0){
   if(!st->refused_since)st->refused_since=send_at;
   u64 elapsed=send_at-st->refused_since;
+  u32 ref_ms=(u32)(elapsed/1000);
+  if(ref_ms>cur->maxref_ms)cur->maxref_ms=ref_ms;
   if(elapsed>100000&&!s->refused_warned){
-   s->refused_warned=1;s->refused_ms=(unsigned)(elapsed/1000);s->refused_backlog=backlog/384;
+   s->refused_warned=1;s->refused_ms=(unsigned)ref_ms;s->refused_backlog=backlog/384;
   }else if(elapsed>REFUSED_US&&s->relinks<3)s->fault=AUDIO_RELINK;
   else if(elapsed>REFUSED_US&&s->relinks==3){s->relinks++;s->relink_limit=1;}
  }else if(rc>0){
+  s->has_pending=0;
+  if(rc==(long)sizeof(pcm))cur->rc_full++;
+  else if(rc==1)cur->rc_one++;
+  else{cur->rc_other++;st->other_rc=rc;}
   st->refused_since=0;s->relinks=0;s->refused_warned=0;s->err_warned=0;
  }
  if(s->fault!=AUDIO_RELINK){
   if(rc<0){
+   s->has_pending=0;
    if(!s->err_warned){s->err_warned=1;s->error_rc=rc;s->error_count=st->errors+1;}
    if(++st->errors>20)s->fault=AUDIO_LINK_LOST;
-  }else{
+  }else if(rc>0){
    st->errors=0;st->packets++;st->ok_at=send_at;
    if(peak>st->meter_peak)st->meter_peak=peak;
+  }else{
+   st->errors=0;
   }
  }
  s->in_flight=0;
@@ -544,9 +589,11 @@ static unsigned audio_tick(struct app*a,u64 now){
   u64 due=s->test_next<s->test_until?s->test_next:s->test_until;
   return (unsigned)(due-done);
  }
- /* Keep the short recheck when PCM is queued. The underfilled path estimates
-  * a longer wait without changing what we submit or the catch-up policy. */
- return 500;
+ if(rc==0)return 1500;
+ if(rem>=4608)return 1500;
+ if(rem>=1536)return 2500;
+ unsigned wait=(1536-rem)*1000/384;
+ return wait<500?500:wait>2000?2000:wait;
 }
 
 static void collect_audio(struct app*a,u64 now,int beat){
