@@ -30,6 +30,17 @@ struct bt_koff {
     u32 conn_state_off;
     u32 conn_policy_off;
     u32 conn_handle_off;
+    u32 conn_bdaddr_off;
+    u32 conn_stream_off;
+    u32 conn_min_bp_off;
+    u32 conn_max_bp_off;
+    u32 stream_queued_off;
+    u32 stream_inflight_off;
+    u32 stream_dropped_off;
+    u32 stream_frames_off;
+    u32 stream_bitpool_off;
+    u32 stream_enc_bp_off;
+    u64 fmt_role_str;
     u64 accept_site;
     u64 fail_stage;
 };
