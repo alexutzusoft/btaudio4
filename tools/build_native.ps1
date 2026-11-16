@@ -26,6 +26,7 @@ Push-Location $out
 try { & (Join-Path $bin 'create-fself.exe') '-in=BluetoothAudio.elf' '-out=BluetoothAudio.oelf' --eboot 'package/eboot.bin' --paid 0x3800000000000011 } finally { Pop-Location }
 if ($LASTEXITCODE) { throw 'Native fself failed' }
 Copy-Item -LiteralPath (Join-Path $out 'icon0.png') -Destination (Join-Path $pkg 'sce_sys/icon0.png') -Force
+Copy-Item -LiteralPath (Join-Path $out 'pic1.png') -Destination (Join-Path $pkg 'sce_sys/pic1.png') -Force
 Copy-Item -LiteralPath (Join-Path $sdk 'samples/hello_world/sce_sys/about/right.sprx') -Destination (Join-Path $pkg 'sce_sys/about/right.sprx') -Force
 foreach ($module in @('libc.prx','libSceFios2.prx')) { Copy-Item -LiteralPath (Join-Path $sdk "samples/hello_world/sce_module/$module") -Destination (Join-Path $pkg "sce_module/$module") -Force }
 Copy-Item -LiteralPath (Join-Path $root "build/BTAudio4-$ver.bin") -Destination (Join-Path $pkg 'assets/BTA-Audio.bin') -Force
@@ -48,7 +49,7 @@ foreach ($entry in $entries) {
 }
 Push-Location $pkg
 try {
-    & (Join-Path $bin 'create-gp4.exe') -out package.gp4 --content-id=IV0000-BTAD00001_00-BTAUDIO000000001 --files 'eboot.bin sce_sys/param.sfo sce_sys/icon0.png sce_sys/about/right.sprx sce_module/libc.prx sce_module/libSceFios2.prx assets/BTA-Audio.bin'
+    & (Join-Path $bin 'create-gp4.exe') -out package.gp4 --content-id=IV0000-BTAD00001_00-BTAUDIO000000001 --files 'eboot.bin sce_sys/param.sfo sce_sys/icon0.png sce_sys/pic1.png sce_sys/about/right.sprx sce_module/libc.prx sce_module/libSceFios2.prx assets/BTA-Audio.bin'
     if ($LASTEXITCODE) { throw 'GP4 generation failed' }
     & $tool pkg_build package.gp4 $out
     if ($LASTEXITCODE) { throw 'PKG build failed' }

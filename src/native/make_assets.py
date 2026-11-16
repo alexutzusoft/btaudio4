@@ -1,9 +1,10 @@
-"""Generate the native app's artwork: smooth UI fonts, icons, logo tile, app icon.
+"""Generate the native app's fonts, icons, and package artwork.
 
 Outputs (under build/native, the native build's -I include dir):
   ui_font.h  - anti-aliased glyph bitmaps at several native pixel sizes
   ui_icons.h - 8-bit alpha masks (tinted at runtime) + the logo tile (ARGB)
   icon0.png  - 512x512 PS4 home-screen icon
+  pic1.png   - 1920x1080 PS4 launch splash
 
 The same data is exposed through build_data() so the PC previewer renders
 exactly what the console will.
@@ -11,11 +12,14 @@ exactly what the console will.
 Font note: glyph bitmaps are baked from DejaVu Sans (free license, see
 LICENSE_DEJAVU.txt), taken from the copy bundled with matplotlib.
 """
+from io import BytesIO
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
+from resvg_py import svg_to_bytes
 
 root = Path(__file__).resolve().parents[2]
 out = root / 'build/native'
+art = Path(__file__).resolve().parent / 'art'
 
 FONT_REG = 'DejaVuSans.ttf'
 FONT_SEMI = 'DejaVuSans-Bold.ttf'
@@ -30,8 +34,6 @@ FACES = [
 ]
 GAMMA = 0.80  # <1 thickens light-on-dark text slightly so it stays crisp on TVs
 
-MINT = (133, 228, 192, 255)
-WHITE = (240, 246, 252, 255)
 SS = 8  # supersampling for icon masks
 
 
@@ -78,7 +80,7 @@ def finish(im, w, h):
 
 
 def draw_headphones(d, cx, cy, s, fill=255):
-    """Band + two earcups; same motif as the app icon, without the rune."""
+    """Band and two earcups for the headphone status and device list."""
     band_w = max(2, int(0.17 * s))
     d.arc((cx - 0.74 * s, cy - 0.72 * s, cx + 0.74 * s, cy + 0.40 * s), 180, 360, fill=fill, width=band_w)
     cup_w, cup_h = 0.27 * s, 0.46 * s
@@ -212,53 +214,26 @@ ICON_SPECS = [
 ]
 
 
-# --- Shared motif for the app icon / logo tile ---------------------------------
-def draw_bt(d, cx, cy, hw, hh, color, width):
-    unit = [(-1, -0.5), (1, 0.5), (0, 1), (0, -1), (1, -0.5), (-1, 0.5)]
-    pts = [(cx + px * hw, cy + py * hh) for px, py in unit]
-    d.line(pts, fill=color, width=width, joint='curve')
-    r = width / 2
-    for px, py in pts:
-        d.ellipse((px - r, py - r, px + r, py + r), fill=color)
-
-
-def draw_motif(img, cx, cy, scale, head_color, bt_color):
-    d = ImageDraw.Draw(img)
-    draw_headphones(d, cx, cy, scale, fill=head_color)
-    draw_bt(d, cx, cy + 0.10 * scale, 0.17 * scale, 0.32 * scale, bt_color, max(2, int(0.075 * scale)))
+# --- Brand artwork -----------------------------------------------------------
+def render_svg(name, mode, **size):
+    png = svg_to_bytes(svg_path=str(art / name), skip_system_fonts=True, **size)
+    with Image.open(BytesIO(png)) as image:
+        return image.convert(mode)
 
 
 def build_icon512():
-    S = 512 * 3
-    top_c, bot_c = (0x12, 0x1b, 0x2c), (0x20, 0x30, 0x48)
-    grad = Image.new('RGB', (S, S))
-    gd = ImageDraw.Draw(grad)
-    for y in range(S):
-        t = y / (S - 1)
-        gd.line([(0, y), (S, y)], fill=tuple(int(top_c[i] * (1 - t) + bot_c[i] * t) for i in range(3)))
-    icon = grad.convert('RGBA')
-    glow = Image.new('RGBA', (S, S), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse((S * 0.26, S * 0.20, S * 0.74, S * 0.66), fill=(133, 228, 192, 70))
-    icon = Image.alpha_composite(icon, glow.filter(ImageFilter.GaussianBlur(S * 0.035)))
-    draw_motif(icon, S * 0.5, S * 0.46, S * 0.33, MINT, WHITE)
-    ImageDraw.Draw(icon).rounded_rectangle((int(S * 0.045), int(S * 0.045), int(S * 0.955), int(S * 0.955)),
-                                           radius=int(S * 0.11), outline=(133, 228, 192, 60), width=max(1, int(S * 0.006)))
-    return icon.resize((512, 512), Image.LANCZOS).convert('RGB')
-
-
-def build_logo_tile(icon, size=72, radius=16):
-    tile = icon.resize((size, size), Image.LANCZOS).convert('RGBA')
-    m = Image.new('L', (size * SS, size * SS), 0)
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, size * SS - 1, size * SS - 1), radius=radius * SS, fill=255)
-    tile.putalpha(m.resize((size, size), Image.LANCZOS))
-    return tile
+    mark = render_svg('btaudio4-logo.svg', 'RGBA', width=336, height=336)
+    icon = Image.new('RGB', (512, 512), '#0e1624')
+    icon.paste(mark, (88, 88), mark.getchannel('A'))
+    return icon
 
 
 def build_data():
-    icon = build_icon512()
     faces = {name: build_face(path, size) for name, path, size in FACES}
     icons = {name: fn() for name, fn in ICON_SPECS}
-    return dict(faces=faces, icons=icons, icon512=icon, logo=build_logo_tile(icon))
+    logo = render_svg('btaudio4-logo.svg', 'RGBA')
+    splash = render_svg('btaudio4-launch-splash.svg', 'RGB')
+    return dict(faces=faces, icons=icons, icon512=build_icon512(), logo=logo, splash=splash)
 
 
 # --- C header emission ---------------------------------------------------------
@@ -290,6 +265,7 @@ def write_headers(data):
     lines.append('static const unsigned int logo_argb[LOGO_W*LOGO_H]={' + ','.join(map(str, vals)) + '};')
     (out / 'ui_icons.h').write_text('\n'.join(lines) + '\n')
     data['icon512'].save(out / 'icon0.png')
+    data['splash'].save(out / 'pic1.png')
 
 
 if __name__ == '__main__':

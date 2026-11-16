@@ -584,7 +584,6 @@ int main(void){
  OrbisUserServiceInitializeParams userparams={ORBIS_KERNEL_PRIO_FIFO_LOWEST};
  int user_rc=sceUserServiceInitialize(&userparams);int pad_rc=scePadInit();
  char diag[128];snprintf(diag,sizeof(diag),"User init=0x%x Pad init=0x%x",user_rc,pad_rc);logline(diag);
- sceSystemServiceHideSplashScreen();
  logline("Checking audio service");service_check();
  start_update_check();
  logline("Starting display loop");
@@ -667,6 +666,7 @@ int main(void){
   if(!auto_snapped&&now-first_draw>2000000){snapshot();auto_snapped=1;}
   if((buttons&(ORBIS_PAD_BUTTON_L3|ORBIS_PAD_BUTTON_R3))==(ORBIS_PAD_BUTTON_L3|ORBIS_PAD_BUTTON_R3)&&now>=snap_cd){snapshot();snap_cd=now+2000000;}
   if(sceVideoOutSubmitFlip(video,buffer,1,flip)<0){sceKernelUsleep(33000);continue;}
+  if(flip==0)sceSystemServiceHideSplashScreen();
   for(int tries=0;tries<1000;tries++){OrbisVideoOutFlipStatus status;if(!sceVideoOutGetFlipStatus(video,&status)&&status.flipArg==flip)break;sceKernelUsleep(1000);}
   buffer^=1;flip++;
  }
