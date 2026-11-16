@@ -21,9 +21,11 @@ struct resolve_args {
 struct input {
     u64 address;
     int mode;
+    int target_bp;
     const struct bt_koff *k;
     struct bt_devices *out;
     struct bt_prep_diag *diag;
+    struct bt_stream_diag *sdiag;
 };
 struct args {
     void *fn;
@@ -67,8 +69,8 @@ static int callback(void *td, struct args *a) {
     u64 address = in->address;
     int mode = in->mode;
     struct bt_devices *destination = in->out;
-    if (mode != 0 && mode != 1) return 22;
-    if (mode == 1 && (!address || address >> 48)) return 22;
+    if (mode < 0 || mode > 2) return 22;
+    if (mode >= 1 && (!address || address >> 48)) return 22;
 
     struct bt_devices out;
     zero_mem(&out, sizeof(out));
@@ -102,13 +104,14 @@ static int callback(void *td, struct args *a) {
                 }
             }
         }
-    } else {
+    } else if (mode == 1) {
         struct bt_prep_diag d_out;
         zero_mem(&d_out, sizeof(d_out));
         rc = 2;
+        int (*command)(void *, unsigned, const char *, ...) = (void *)k->cmd_fn;
         for (unsigned off = k->conn_off; off < k->conn_end; off += k->conn_stride) {
             unsigned char *c = ctx + off;
-            if (*(u64 *)(c + 0x30) != address) continue;
+            if (*(u64 *)(c + k->conn_bdaddr_off) != address) continue;
             unsigned char *d = *(void **)(c + k->conn_dev_off);
             d_out.conn_state = *(unsigned *)(c + k->conn_state_off);
             d_out.conn_policy = *(unsigned *)(c + k->conn_policy_off);
@@ -125,14 +128,25 @@ static int callback(void *td, struct args *a) {
             if (d_out.conn_state >= 3) {
                 d_out.skipped = 1;
                 rc = 0;
-                break;
+            } else {
+                rc = command(ctx, 0x40f, (const char *)k->fmt_str, (unsigned)d_out.handle, 0x3c18);
+                if (rc >= 0) {
+                    *(unsigned *)(c + k->conn_policy_off) = 0x3c18;
+                    d_out.conn_policy = 0x3c18;
+                    rc = 0;
+                }
             }
-            int (*command)(void *, unsigned, const char *, ...) = (void *)k->cmd_fn;
-            rc = command(ctx, 0x40f, (const char *)k->fmt_str, (unsigned)d_out.handle, 0x3c18);
-            if (rc >= 0) {
-                *(unsigned *)(c + k->conn_policy_off) = 0x3c18;
-                d_out.conn_policy = 0x3c18;
-                rc = 0;
+            /* Best-effort single-piconet Role Switch (PS4 = Master) for audio
+             * devices without setting conn_flags 0x4000, so non-cooperative buds
+             * are never disconnected. */
+            if (rc == 0 && d_out.handle) {
+                d_out.lps_rc = command(ctx, 0x80d, (const char *)k->fmt_str, (unsigned)d_out.handle, 0x0005);
+                if (k->fmt_role_str) {
+                    d_out.role_rc = command(ctx, 0x80b, (const char *)k->fmt_role_str,
+                                            *(u64 *)(c + k->conn_bdaddr_off), 0);
+                } else {
+                    d_out.role_rc = -1;
+                }
             }
             break;
         }
@@ -141,6 +155,62 @@ static int callback(void *td, struct args *a) {
         if (in->diag) {
             int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
             int cprc = copyout(&d_out, in->diag, sizeof(d_out));
+            if (cprc && !rc) rc = cprc;
+        }
+        return rc;
+    } else {
+        struct bt_stream_diag s_out;
+        zero_mem(&s_out, sizeof(s_out));
+        rc = 2;
+        if (!k->conn_stream_off || !k->stream_dropped_off || !k->stream_bitpool_off) {
+            rc = 22;
+        } else {
+            for (unsigned off = k->conn_off; off < k->conn_end; off += k->conn_stride) {
+                unsigned char *c = ctx + off;
+                if (*(u64 *)(c + k->conn_bdaddr_off) != address) continue;
+                unsigned char *d = *(void **)(c + k->conn_dev_off);
+                if (!d || ((u64)d >> 48) != 0xffff || !(*(unsigned *)(d + 0x20) & 8)) {
+                    rc = 93;
+                    break;
+                }
+                unsigned char *st = *(void **)(c + k->conn_stream_off);
+                if (!st || ((u64)st >> 48) != 0xffff) {
+                    rc = 6;
+                    break;
+                }
+                s_out.dropped = *(unsigned *)(st + k->stream_dropped_off);
+                s_out.inflight = *(int *)(st + k->stream_inflight_off);
+                s_out.queued = *(int *)(st + k->stream_queued_off);
+                s_out.frames = *(int *)(st + k->stream_frames_off);
+                s_out.min_bp = *(int *)(c + k->conn_min_bp_off);
+                s_out.max_bp = *(int *)(c + k->conn_max_bp_off);
+                int cur_bp = *(int *)(st + k->stream_bitpool_off);
+                int enc_bp = k->stream_enc_bp_off ? *(int *)(st + k->stream_enc_bp_off) : 0;
+                if (in->target_bp > 0) {
+                    int lo = (s_out.min_bp >= 2 && s_out.min_bp <= 53) ? s_out.min_bp : 2;
+                    if (lo < 18) lo = 18;
+                    int hi = (s_out.max_bp >= lo && s_out.max_bp <= 53) ? s_out.max_bp : 53;
+                    int bp = in->target_bp;
+                    if (bp < lo) bp = lo;
+                    if (bp > hi) bp = hi;
+                    *(int *)(st + k->stream_bitpool_off) = bp;
+                    cur_bp = bp;
+                    if (k->stream_enc_bp_off && enc_bp > 0) {
+                        *(int *)(st + k->stream_enc_bp_off) = bp;
+                        enc_bp = bp;
+                    }
+                }
+                s_out.bitpool = cur_bp;
+                s_out.enc_bp = enc_bp;
+                rc = 0;
+                break;
+            }
+        }
+        s_out.rc = rc;
+        unlock(0);
+        if (in->sdiag) {
+            int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
+            int cprc = copyout(&s_out, in->sdiag, sizeof(s_out));
             if (cprc && !rc) rc = cprc;
         }
         return rc;
@@ -175,6 +245,11 @@ int bt_prepare_diag(u64 address, struct bt_prep_diag *diag) {
 
 int bt_prepare(u64 address) {
     return bt_prepare_diag(address, 0);
+}
+
+int bt_stream_tune(u64 address, int target_bp, struct bt_stream_diag *diag) {
+    struct input in = {.address = address, .mode = 2, .target_bp = target_bp, .sdiag = diag};
+    return invoke(&in);
 }
 
 const struct bt_koff *bt_koff_info(void) {

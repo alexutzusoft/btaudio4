@@ -310,6 +310,121 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
     return 0;
 }
 
+static void resolve_role_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
+    static const s16 op_80b[] = {0xbe, 0x0b, 0x08, 0x00, 0x00};
+    static const s16 op_409[] = {0xbe, 0x09, 0x04, 0x00, 0x00};
+    u64 end = bt_start + bt_len;
+    for (int p = 0; p < 2; p++) {
+        const s16 *pat = (p == 0) ? op_80b : op_409;
+        u64 pos = bt_start;
+        while (pos < end) {
+            u64 hit = scan_first(pos, end - pos, pat, 5);
+            if (!hit) break;
+            u64 w0 = (hit > bt_start + 0x20) ? (hit - 0x20) : bt_start;
+            for (u64 a = w0; a + 7 <= hit; a++) {
+                if (*(const u8 *)a == 0x48 && *(const u8 *)(a + 1) == 0x8d && *(const u8 *)(a + 2) == 0x15) {
+                    u64 cand = (a + 7) + (u64)(s64)rds32(a + 3);
+                    if ((cand >> 48) == 0xffff &&
+                        *(const u8 *)cand == '6' && *(const u8 *)(cand + 1) == '1' && *(const u8 *)(cand + 2) == 0) {
+                        out->fmt_role_str = cand;
+                        break;
+                    }
+                }
+            }
+            if (p == 0 && out->fmt_role_str) {
+                u64 w1 = (hit + 0x20 < end) ? (hit + 0x20) : end;
+                for (u64 a = hit; a + 4 <= w1; a++) {
+                    u8 rex = *(const u8 *)a;
+                    if ((rex == 0x48 || rex == 0x49) && *(const u8 *)(a + 1) == 0x8b) {
+                        u8 modrm = *(const u8 *)(a + 2);
+                        if ((modrm & 0xc7) == 0x46 || (modrm & 0xc7) == 0x47) {
+                            u32 off8 = *(const u8 *)(a + 3);
+                            if (off8 >= 0x20 && off8 <= 0x80) {
+                                out->conn_bdaddr_off = off8;
+                                break;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if (out->fmt_role_str) return;
+            pos = hit + 1;
+        }
+    }
+}
+
+static void resolve_audio_off(u64 bt_start, u64 bt_len, struct bt_koff *out) {
+    static const s16 cmp5_pat[] = {0x83, 0xf8, 0x05, 0x0f, 0x8c};
+    u64 end = bt_start + bt_len;
+    u64 pos = bt_start;
+    while (pos < end) {
+        u64 hit = scan_first(pos, end - pos, cmp5_pat, 5);
+        if (!hit) break;
+        /* Confirm `cdq; idiv` (99 f7) shortly before `cmp eax, 5; jl`. */
+        u64 w_idiv = (hit > bt_start + 0x24) ? (hit - 0x24) : bt_start;
+        u64 idiv_at = 0;
+        for (u64 a = w_idiv; a + 2 <= hit; a++) {
+            if (*(const u8 *)a == 0x99 && *(const u8 *)(a + 1) == 0xf7) idiv_at = a;
+        }
+        /* Confirm `inc dword [r+disp32]; (rex) inc qword [r+disp32]` within drop block. */
+        u64 drop_end = (hit + 0xa0 < end) ? (hit + 0xa0) : end;
+        u32 dropped = 0;
+        for (u64 a = hit + 9; a + 13 <= drop_end; a++) {
+            u8 b0 = *(const u8 *)a;
+            u8 mod = *(const u8 *)(a + 1);
+            if (b0 == 0xff && mod >= 0x80 && mod <= 0x87 && mod != 0x84) {
+                u32 d = rd32(a + 2);
+                u8 n0 = *(const u8 *)(a + 6);
+                u8 n1 = *(const u8 *)(a + 7);
+                if (d >= 0x1000 && d < 0x8000 && (n0 == 0x48 || n0 == 0x49) && n1 == 0xff) {
+                    dropped = d;
+                    break;
+                }
+            }
+        }
+        if (idiv_at && dropped) {
+            out->stream_dropped_off = dropped;
+            if (hit >= w_idiv + 6 && *(const u8 *)(hit - 6) == 0x03) {
+                u32 inf = rd32(hit - 4);
+                if (inf >= 0x1000 && inf < 0x8000) out->stream_inflight_off = inf;
+            }
+            u64 w_q = (idiv_at > bt_start + 0x20) ? (idiv_at - 0x20) : bt_start;
+            u32 loads[2] = {0, 0};
+            int nloads = 0;
+            for (u64 a = w_q; a + 6 <= idiv_at && nloads < 2; a++) {
+                if (*(const u8 *)a == 0x8b && (*(const u8 *)(a + 1) & 0xc0) == 0x80) {
+                    u32 d = rd32(a + 2);
+                    if (d >= 0x1000 && d < 0x8000) loads[nloads++] = d;
+                }
+            }
+            if (nloads == 2) {
+                out->stream_queued_off = loads[0];
+                out->stream_frames_off = loads[1];
+            }
+            u64 w_bp = (idiv_at > bt_start + 0xf0) ? (idiv_at - 0xf0) : bt_start;
+            for (u64 a = w_bp; a + 2 <= idiv_at; a++) {
+                if (*(const u8 *)a == 0x0f && *(const u8 *)(a + 1) == 0x4e) {
+                    u64 scan0 = (a > w_bp + 0x20) ? (a - 0x20) : w_bp;
+                    for (u64 b = scan0; b + 6 <= a; b++) {
+                        if (*(const u8 *)b == 0x8b && (*(const u8 *)(b + 1) & 0xc0) == 0x80) {
+                            u32 d = rd32(b + 2);
+                            if (d >= 0x1000 && d < 0x8000) out->stream_bitpool_off = d;
+                            else if (d >= 0x600 && d < 0x1500) {
+                                out->conn_max_bp_off = d;
+                                out->conn_min_bp_off = d - 4;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            return;
+        }
+        pos = hit + 1;
+    }
+}
+
 static int resolve_cache_and_bounds(u64 bt_start, u64 bt_len, struct bt_koff *out) {
     static const s16 pat_3200[] = {0x41, 0xbd, 0x00, 0x32, 0x00, 0x00};
     static const s16 pat_0107[] = {0x41, 0xbc, 0x07, 0x01, 0x2f, 0x80};
@@ -401,6 +516,16 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     out->conn_state_off = 0x1560;
     out->conn_policy_off = 0x1564;
     out->conn_handle_off = 0x48;
+    out->conn_bdaddr_off = 0x30;
+    out->conn_stream_off = 0x8;
+    out->conn_min_bp_off = 0xb88;
+    out->conn_max_bp_off = 0xb8c;
+    out->stream_queued_off = 0x3930;
+    out->stream_inflight_off = 0x3934;
+    out->stream_dropped_off = 0x3944;
+    out->stream_frames_off = 0x43cc;
+    out->stream_bitpool_off = 0x43d0;
+    out->stream_enc_bp_off = 0x5c;
 
     out->lock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_lock");
     if (!out->lock_fn) { out->fail_stage = 4; return -1; }
@@ -412,6 +537,8 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     if (resolve_cache_and_bounds(bt_start, bt_len, out)) { out->fail_stage = 7; return -1; }
     out->ctx_ptr = resolve_ctx_ptr(bt_start, bt_len, ro, n_ro);
     if (!out->ctx_ptr) { out->fail_stage = 8; return -1; }
+    resolve_role_fmt(bt_start, bt_len, out);
+    resolve_audio_off(bt_start, bt_len, out);
 
     out->valid = 1;
     return 0;

@@ -29,10 +29,23 @@ struct bt_prep_diag {
  int rc,skipped;
  unsigned conn_state,conn_policy,dev_services;
  unsigned short handle,reserved;
+ int lps_rc,role_rc;
+};
+struct bt_stream_diag {
+ int rc;
+ unsigned dropped;
+ int inflight;
+ int queued;
+ int frames;
+ int bitpool;
+ int enc_bp;
+ int min_bp;
+ int max_bp;
 };
 struct bt_koff;
 int bt_list(struct bt_devices*);
 int bt_prepare(unsigned long address);
 int bt_prepare_diag(unsigned long address, struct bt_prep_diag *diag);
+int bt_stream_tune(unsigned long address, int target_bp, struct bt_stream_diag *diag);
 const struct bt_koff *bt_koff_info(void);
 #endif
