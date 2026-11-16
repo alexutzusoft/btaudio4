@@ -67,6 +67,8 @@ powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build
 
 ## Credits & Licenses
 
+- u/YoxScorpion for testing with QCY H3 headphones and reporting audio latency and DVD TV mute issues.
+- u/Party-Chance-4125 for testing multiple Bluetooth audio devices and reporting audio dropouts in games.
 - Font assets: DejaVu (`src/native/LICENSE_DEJAVU.txt`).
 - AutoRun entry format: documented in [orbisRPC](https://github.com/SirHumza/orbisRPC/tree/main/installer).
 - Requires [GoldHEN](https://github.com/GoldHEN/GoldHEN) (not included).
