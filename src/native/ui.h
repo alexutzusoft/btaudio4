@@ -286,6 +286,9 @@ static void draw(int pinmode,const char*pin,int digit){
  rrect(124,544,236,8,4,LINE);int vw=236*state.volume/100;if(vw>=8)rrect(124,544,vw,8,4,MINT);
  disc(124+vw,548,9,TEXT,255);
  snprintf(buf,sizeof(buf),"%d%%",state.volume);text_r(F_BODY,424,556,buf,TEXT);
+ if(l==BT_LINK_STREAMING&&ext_ok){
+  text_c(F_SMALL,cx,580,state.volume_synced?"Synced with headphones":"Software volume",state.volume_synced?MINT:FAINT,352);
+ }
 
  /* headphone list card */
  rrect(472,212,752,384,22,CARD);

@@ -22,6 +22,7 @@ struct bt_native { unsigned magic,version; int streaming,wanted,tv,muted,scannin
  int quiet_ms;      /* while streaming: ms since a packet was last sent */
  int test;          /* test tone playing */
  int connect_rc,audio_rc; /* last driver results; 0 = fine */
+ int volume_synced;       /* 1 when synced with headphone AVRCP hardware volume */
 };
 static inline int bt_is_audio(const struct bt_device*d){return (d->services&8)||(((d->cod>>8)&31)==4&&!(d->services&0x40));}
 struct bt_prep_diag {

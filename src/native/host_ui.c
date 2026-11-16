@@ -19,6 +19,7 @@ static void apply(const char*k,const char*v){
  else if(!strcmp(k,"muted"))state.muted=atoi(v);
  else if(!strcmp(k,"scanning"))state.scanning=atoi(v);
  else if(!strcmp(k,"volume"))state.volume=atoi(v);
+ else if(!strcmp(k,"volume_synced"))state.volume_synced=atoi(v);
  else if(!strcmp(k,"selected"))state.selected=(unsigned long)strtoull(v,0,16);
  else if(!strcmp(k,"message"))snprintf(state.message,sizeof(state.message),"%s",v);
  else if(!strcmp(k,"attempts"))state.attempts=atoi(v);

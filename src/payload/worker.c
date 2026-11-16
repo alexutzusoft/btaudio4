@@ -29,7 +29,7 @@ struct audio_stats{
  * mapping and descriptors and waits for an in-flight submission before teardown. */
 struct audio_stream{
  const u8*ring;long bt;u64 address;
- int active,in_flight,volume,joint;
+ int active,in_flight,volume,volume_synced,joint;
  u32 readpos,test_phase;
  u64 test_until,test_next,last_send;
  struct audio_stats stats;
@@ -50,7 +50,7 @@ struct app{
  long patch_rc,packet_rc,connect_rc,last_rc,other_rc,hdmi_rc,btstate,list_rc;
  u64 next_try,deadline,scan_at,heartbeat,poll_at,net_at,packets,errors,resyncs;
  int net_poll_failed;
- unsigned level;int volume;char message[128];
+ unsigned level;int volume,volume_synced,avrcp_pending,avrcp_retries;u64 avrcp_retry_at;char message[128];
  /* Per-packet timing, summarised per second (GET /api/timing). gap: time between two
   * sends (4 ms is on time). send: how long the driver call took. backlog: capture audio
   * waiting to be sent. refused: the driver returned 0. failed: it returned an error. */
@@ -98,7 +98,7 @@ static void sync_audio_controls(struct app*a){
  if(!a->streaming)return;
  lock_state(a);
  struct audio_stream*s=&a->audio;
- s->volume=a->volume;s->joint=a->joint;
+ s->volume=a->volume;s->volume_synced=a->volume_synced;s->joint=a->joint;
  if(s->test_until!=a->test_until){s->test_until=a->test_until;s->test_phase=0;s->test_next=0;}
  unlock_state(a);
 }
@@ -178,7 +178,7 @@ static void stop_audio(struct app*a){
  unlock_state(a);
  if(a->phase==4&&a->bt>=0){sc3(54,a->bt,0x20046205,0);a->scanning=0;}
  if(a->streaming){short silence[384];memset(silence,0,sizeof(silence));struct audio_req q={a->target.address,silence,sizeof(silence),0,0};sc3(54,a->bt,0x80206216,(long)&q);}
- a->streaming=0;a->phase=0;a->level=0;a->meter=0;a->meter_peak=0;a->pin_pending=0;a->test_until=0;mute(a,0);
+ a->streaming=0;a->phase=0;a->level=0;a->meter=0;a->meter_peak=0;a->pin_pending=0;a->test_until=0;a->volume_synced=0;a->avrcp_pending=0;a->avrcp_retries=0;a->audio.volume_synced=0;mute(a,0);
  if(a->ring){a->unmap(a->ring,0x10000);a->ring=0;}closefd(a->shmfd);a->shmfd=-1;
  if(was_streaming&&wlog_begin(a,a->clock(),"audio_stop")){wlog_raw(a,"packets=");wlog_dec(a,(long)a->packets);wlog_raw(a," resyncs=");wlog_dec(a,(long)a->resyncs);wlog_raw(a," relinks=");wlog_dec(a,(long)a->relinks_total);wlog_end(a,1);}
 }
@@ -270,6 +270,34 @@ static void load_volume(struct app*a){
  if(fd<0)return;long n=sc3(3,fd,(long)&value,sizeof(value));closefd(fd);
  if(n==sizeof(value)&&value<=100)a->volume=(int)value;
 }
+static int avrcp_to_pct(int raw){if(raw<=0)return 0;if(raw>=127)return 100;return (raw*100+63)/127;}
+static int pct_to_avrcp(int pct){if(pct<=0)return 0;if(pct>=100)return 127;return (pct*127+50)/100;}
+/* AVRCP SetAbsoluteVolume (0x50) via /dev/bt ioctl 0x80106212. Non-blocking;
+ * queues behind L2CAP PSM 0x17 open if needed (returns 0x802f0605 if one is already pending). */
+static void avrcp_set_volume(struct app*a,int pct){
+ if(a->bt<0||!a->target.address)return;
+ if(!a->streaming&&(a->btstate<5||a->btstate>6))return;
+ struct{u64 address;u8 volume;u8 pad[7];}q={a->target.address,(u8)pct_to_avrcp(pct),{0}};
+ long rc=sc3(54,a->bt,0x80106212,(long)&q);
+ if(rc==0){a->avrcp_pending=0;a->avrcp_retries=0;}
+ else if((u32)rc==0x802f0605U){a->avrcp_pending=1;a->avrcp_retry_at=a->clock()+250000;}
+ else{a->avrcp_pending=0;a->avrcp_retries=0;}
+ if(wlog_begin(a,a->clock(),rc?"WARN avrcp_set":"avrcp_set")){
+  wlog_raw(a,"vol=");wlog_dec(a,pct);wlog_raw(a," raw=");wlog_dec(a,(long)q.volume);
+  wlog_raw(a," rc=");wlog_hex(a,(u64)(u32)rc);wlog_end(a,rc!=0);
+ }
+}
+static void avrcp_query_volume(struct app*a){
+ if(a->bt<0||!a->target.address)return;
+ u64 address=a->target.address;
+ long rc=sc3(54,a->bt,0x80086213,(long)&address);
+ if(rc>=0&&rc<=127){
+  int pct=avrcp_to_pct((int)rc);
+  a->volume_synced=1;
+  if(pct!=a->volume)save_volume(a,pct);
+  if(wlog_begin(a,a->clock(),"avrcp_init")){wlog_raw(a,"raw=");wlog_dec(a,rc);wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_end(a,0);}
+ }
+}
 static void wlog_patch(struct app*a,u64 now){
  if(a->patch_logged&&!a->patch_rc)return;
  a->patch_logged=1;
@@ -338,10 +366,11 @@ static void start_audio(struct app*a){
   wlog_raw(a," peers=");wlog_dec(a,(long)peers);wlog_raw(a," hid=");wlog_dec(a,(long)hid);wlog_end(a,1);
  }
  say(a,"Connected to ",a->tv?". TV sound is on.":". TV sound is muted.");
+ avrcp_query_volume(a);
  lock_state(a);
  struct audio_stream*s=&a->audio;
  s->ring=a->ring;s->bt=a->bt;s->address=a->target.address;s->readpos=readpos;
- s->volume=a->volume;s->joint=a->joint;s->test_until=s->test_next=s->last_send=0;s->test_phase=0;
+ s->volume=a->volume;s->volume_synced=a->volume_synced;s->joint=a->joint;s->test_until=s->test_next=s->last_send=0;s->test_phase=0;
  s->stats.errors=s->stats.refused_since=s->stats.level=s->stats.meter_peak=0;s->stats.other_rc=0;s->stats.ok_at=a->stream_at;
  s->fault=AUDIO_OK;s->resync_backlog=0;s->refused_warned=s->err_warned=s->relink_limit=0;
  s->refused_ms=0;s->error_count=0;s->has_pending=0;s->was_testing=0;s->pending_peak=0;s->active=1;
@@ -373,8 +402,23 @@ static void bluetooth_tick(struct app*a,u64 now){
    if(is_target&&a->wanted){
     if(ev[i].type==4){u64 q[2]={a->target.address,1};sc3(54,a->bt,0x80106208,(long)q);}
     if(ev[i].type==3){a->pin_pending=1;a->deadline=now+60000000;message(a,"These headphones require a pairing PIN.");}
+    if(ev[i].type==11&&ev[i].subtype<=2){
+     int raw=(int)(ev[i].data&0x7f),pct=avrcp_to_pct(raw),was_synced=a->volume_synced;
+     a->volume_synced=1;a->avrcp_pending=0;a->avrcp_retries=0;
+     int accept=(ev[i].subtype!=2)||(pct_to_avrcp(a->volume)!=raw);
+     if(accept&&pct!=a->volume)save_volume(a,pct);
+     if(!was_synced||accept)sync_audio_controls(a);
+     if(wlog_begin(a,now,"avrcp_vol")){
+      wlog_raw(a,"sub=");wlog_dec(a,ev[i].subtype);wlog_raw(a," raw=");wlog_dec(a,raw);
+      wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_end(a,0);
+     }
+    }
    }
   }
+ }
+ if(a->avrcp_pending&&a->bt>=0&&now>=a->avrcp_retry_at){
+  if(a->avrcp_retries<8){a->avrcp_retries++;avrcp_set_volume(a,a->volume);}
+  else{a->avrcp_pending=0;a->avrcp_retries=0;}
  }
  if(!a->wanted)return;
  if(a->phase==0){if(now>=a->next_try){a->attempts++;a->failed=0;begin_connect(a);}return;}
@@ -486,8 +530,9 @@ static unsigned audio_tick(struct app*a,u64 now){
    return (unsigned)(due-now);
   }
   s->test_next=now+4000;
+  int eff_vol=s->volume_synced?(s->volume>0?100:0):s->volume;
   for(unsigned i=0;i<192;i++){
-   short v=(short)(SINE32[(s->test_phase>>8)&31]*2*s->volume/100);
+   short v=(short)(SINE32[(s->test_phase>>8)&31]*2*eff_vol/100);
    s->test_phase+=75;pcm[2*i]=v;pcm[2*i+1]=v;
    unsigned m=v<0?-v:v;if(m>peak)peak=m;
   }
@@ -519,7 +564,8 @@ static unsigned audio_tick(struct app*a,u64 now){
    backlog=available;
    rem=available-1536;
    u32 cursor=s->readpos;
-   float gain=32767.0f*(float)s->volume/100.0f;
+   int eff_vol=s->volume_synced?(s->volume>0?100:0):s->volume;
+   float gain=32767.0f*(float)eff_vol/100.0f;
    for(unsigned i=0;i<384;i++){
     float f=*(const volatile float*)(s->ring+cursor);
     cursor+=4;if(cursor==0x10000)cursor=16;
@@ -665,7 +711,7 @@ static int quiet_for_ms(struct app*a,u64 now){if(!a->streaming||now<a->ok_at)ret
 static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
  struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",__atomic_load_n(&a->sender_prio,__ATOMIC_RELAXED));field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
- field(&w,"volume",a->volume);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
+ field(&w,"volume",a->volume);field(&w,"volume_synced",a->volume_synced);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;
@@ -681,7 +727,7 @@ static unsigned timing_json(struct app*a,char*out,unsigned cap){
  append(&w,"]}");return w.used;
 }
 static unsigned native_status(struct app*a,char*out){struct bt_native*n=(void*)out;memset(n,0,sizeof(*n));n->magic=BT_NATIVE_MAGIC;n->version=2;n->volume=a->volume;n->streaming=a->streaming;n->wanted=a->wanted;n->tv=a->tv;n->muted=a->muted==1;n->scanning=a->scanning;n->pin_pending=a->pin_pending;n->selected=a->target.address;memcpy(n->message,a->message,sizeof(n->message));for(unsigned i=0;i<a->devices.count;i++)if(bt_is_audio(&a->devices.items[i])||a->devices.items[i].address==a->target.address)n->devices[n->count++]=a->devices.items[i];
- u64 now=a->clock();n->link=link_state(a);n->attempts=(int)a->attempts;n->retry_ms=retry_in_ms(a,now);n->meter=a->meter;n->quiet_ms=quiet_for_ms(a,now);n->test=now<a->test_until;n->connect_rc=(int)a->connect_rc;n->audio_rc=(int)a->last_rc;
+ u64 now=a->clock();n->link=link_state(a);n->attempts=(int)a->attempts;n->retry_ms=retry_in_ms(a,now);n->meter=a->meter;n->quiet_ms=quiet_for_ms(a,now);n->test=now<a->test_until;n->connect_rc=(int)a->connect_rc;n->audio_rc=(int)a->last_rc;n->volume_synced=a->volume_synced;
  return sizeof(*n);}
 static void response(struct client*c,const char*code,const char*type,const char*body,unsigned n){
  struct writer w={c->output,0,sizeof(c->output)};append(&w,"HTTP/1.1 ");append(&w,code);append(&w,"\r\nContent-Type: ");append(&w,type);append(&w,"\r\nContent-Length: ");number(&w,n);
@@ -738,7 +784,8 @@ static void dispatch(struct app*a,struct client*c){
   while(p[n]>='0'&&p[n]<='9'&&n<3){value=value*10+(unsigned)(p[n]-'0');n++;}
   if(!n||value>100||!starts(p+n," HTTP/1.")){response(c,"400 Bad Request","text/plain","Volume must be 0-100.",21);return;}
   if(save_volume(a,(int)value)){response(c,"500 Internal Server Error","text/plain","Cannot save volume.",19);return;}
-  if(wlog_begin(a,a->clock(),"cmd_volume")){wlog_raw(a,"vol=");wlog_dec(a,a->volume);wlog_end(a,0);}
+  a->avrcp_retries=0;avrcp_set_volume(a,(int)value);
+  if(wlog_begin(a,a->clock(),"cmd_volume")){wlog_raw(a,"vol=");wlog_dec(a,a->volume);wlog_raw(a," synced=");wlog_dec(a,a->volume_synced);wlog_end(a,0);}
  }
  else if(starts(c->input,"POST /api/test HTTP/1.")){
   if(!a->streaming||a->bt<0||a->btstate<5||a->btstate>6){response(c,"409 Conflict","text/plain","Connect headphones first.",25);return;}
