@@ -9,8 +9,7 @@ Outputs (under build/native, the native build's -I include dir):
 The same data is exposed through build_data() so the PC previewer renders
 exactly what the console will.
 
-Font note: glyph bitmaps are baked from DejaVu Sans (free license, see
-LICENSE_DEJAVU.txt), taken from the copy bundled with matplotlib.
+Glyph bitmaps and splash text use the bundled Inter variable font.
 """
 from io import BytesIO
 from pathlib import Path
@@ -21,42 +20,39 @@ root = Path(__file__).resolve().parents[2]
 out = root / 'build/native'
 art = Path(__file__).resolve().parent / 'art'
 
-FONT_REG = 'DejaVuSans.ttf'
-FONT_SEMI = 'DejaVuSans-Bold.ttf'
+FONT = art / 'InterVariable.ttf'
 
-# name, file, pixel size. Sizes are native: nothing is ever pixel-doubled.
+# Name, weight, native pixel size, and letter spacing in pixels.
 FACES = [
-    ('TITLE', FONT_SEMI, 40),
-    ('NAME', FONT_SEMI, 27),
-    ('BODY', FONT_REG, 23),
-    ('SMALL', FONT_REG, 20),
-    ('SMALLB', FONT_SEMI, 20),
+    ('TITLE', 625, 39, -1.05),
+    ('DIALOG', 630, 29, -0.65),
+    ('SECTION', 625, 25, -0.45),
+    ('BRAND', 650, 20, -0.45),
+    ('LABEL', 600, 20, 0),
+    ('KICKER', 550, 17, 0),
+    ('NAME', 550, 19, 0),
+    ('BODY', 400, 16, 0),
+    ('SMALL', 400, 15, 0),
+    ('SMALLB', 600, 16, 0),
+    ('KEY', 550, 12, 0),
 ]
-GAMMA = 0.80  # <1 thickens light-on-dark text slightly so it stays crisp on TVs
+GAMMA = 0.90  # Slightly reinforce antialiased strokes on TV output.
 
-SS = 8  # supersampling for icon masks
-
-
-def _font(name, size):
-    import importlib.util
-    spec = importlib.util.find_spec('matplotlib')
-    if spec is None or not spec.origin:
-        raise SystemExit('matplotlib is required: it supplies the DejaVu Sans font files.')
-    p = Path(spec.origin).parent / 'mpl-data/fonts/ttf' / name
-    if not p.exists():
-        raise SystemExit(f'DejaVu font not found: {p}')
-    return ImageFont.truetype(str(p), size)
+def _font(weight, size):
+    font = ImageFont.truetype(str(FONT), size)
+    font.set_variation_by_axes([min(32, max(14, size)), weight])
+    return font
 
 
 # --- Fonts -------------------------------------------------------------------
-def build_face(path, size):
-    font = _font(path, size)
+def build_face(weight, size, tracking):
+    font = _font(weight, size)
     asc, desc = font.getmetrics()
     lut = [min(255, round(255 * ((i / 255.0) ** GAMMA))) for i in range(256)]
     glyphs, bits = [], bytearray()
     for code in range(32, 127):
         ch = chr(code)
-        adv16 = round(font.getlength(ch) * 16)
+        adv16 = round((font.getlength(ch) + tracking) * 16)
         x0, y0, x1, y1 = font.getbbox(ch, anchor='ls')
         w, h = x1 - x0, y1 - y0
         if w <= 0 or h <= 0 or ch == ' ':
@@ -71,167 +67,73 @@ def build_face(path, size):
 
 
 # --- Icons (alpha masks) ------------------------------------------------------
-def mask_canvas(w, h):
-    return Image.new('L', (w * SS, h * SS), 0)
-
-
-def finish(im, w, h):
-    return im.resize((w, h), Image.LANCZOS)
-
-
-def draw_headphones(d, cx, cy, s, fill=255):
-    """Band and two earcups for the headphone status and device list."""
-    band_w = max(2, int(0.17 * s))
-    d.arc((cx - 0.74 * s, cy - 0.72 * s, cx + 0.74 * s, cy + 0.40 * s), 180, 360, fill=fill, width=band_w)
-    cup_w, cup_h = 0.27 * s, 0.46 * s
-    top = cy - 0.18 * s
-    rad = int(cup_w * 0.45)
-    d.rounded_rectangle((cx - 0.74 * s, top, cx - 0.74 * s + cup_w, top + cup_h), radius=rad, fill=fill)
-    d.rounded_rectangle((cx + 0.74 * s - cup_w, top, cx + 0.74 * s, top + cup_h), radius=rad, fill=fill)
-
-
-def icon_headphones(size):
-    im = mask_canvas(size, size)
-    draw_headphones(ImageDraw.Draw(im), size * SS * 0.5, size * SS * 0.50, size * SS * 0.60)
-    return finish(im, size, size)
-
-
-def icon_check(size):
-    im = mask_canvas(size, size)
-    d = ImageDraw.Draw(im)
-    w = int(size * SS * 0.13)
-    pts = [(0.27, 0.53), (0.44, 0.70), (0.75, 0.33)]
-    pts = [(x * size * SS, y * size * SS) for x, y in pts]
-    d.line(pts, fill=255, width=w, joint='curve')
-    for x, y in (pts[0], pts[2]):
-        d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=255)
-    return finish(im, size, size)
-
-
-def icon_bang(size):
-    im = mask_canvas(size, size)
-    d = ImageDraw.Draw(im)
-    S = size * SS
-    w = 0.15 * S
-    d.rounded_rectangle((S / 2 - w / 2, 0.20 * S, S / 2 + w / 2, 0.60 * S), radius=int(w / 2), fill=255)
-    d.ellipse((S / 2 - w / 2, 0.70 * S, S / 2 + w / 2, 0.70 * S + w), fill=255)
-    return finish(im, size, size)
-
-
-def icon_cross_mark(size):
-    im = mask_canvas(size, size)
-    d = ImageDraw.Draw(im)
-    S = size * SS
-    w = int(0.13 * S)
-    for a, b in (((0.28, 0.28), (0.72, 0.72)), ((0.72, 0.28), (0.28, 0.72))):
-        d.line([(a[0] * S, a[1] * S), (b[0] * S, b[1] * S)], fill=255, width=w)
-        for x, y in (a, b):
-            d.ellipse((x * S - w / 2, y * S - w / 2, x * S + w / 2, y * S + w / 2), fill=255)
-    return finish(im, size, size)
-
-
-def icon_speaker(size):
-    im = mask_canvas(size, size)
-    d = ImageDraw.Draw(im)
-    S = size * SS
-    d.polygon([(0.10 * S, 0.38 * S), (0.30 * S, 0.38 * S), (0.52 * S, 0.18 * S), (0.52 * S, 0.82 * S),
-               (0.30 * S, 0.62 * S), (0.10 * S, 0.62 * S)], fill=255)
-    w = int(0.075 * S)
-    d.arc((0.40 * S, 0.30 * S, 0.76 * S, 0.70 * S), -50, 50, fill=255, width=w)
-    d.arc((0.40 * S, 0.14 * S, 0.94 * S, 0.86 * S), -50, 50, fill=255, width=w)
-    return finish(im, size, size)
-
-
-def icon_glow(size):
-    """Soft radial falloff used as a state-coloured halo."""
-    im = Image.new('L', (size, size), 0)
-    px = im.load()
-    c = (size - 1) / 2.0
-    for y in range(size):
-        for x in range(size):
-            r = ((x - c) ** 2 + (y - c) ** 2) ** 0.5 / c
-            if r < 1:
-                t = 1 - r
-                px[x, y] = int(255 * t * t * (3 - 2 * t))
-    return im
-
-
-def btn_cross(size):
-    return icon_cross_mark_thin(size)
-
-
-def icon_cross_mark_thin(size):
-    im = mask_canvas(size, size)
-    d = ImageDraw.Draw(im)
-    S = size * SS
-    w = int(0.13 * S)
-    for a, b in (((0.24, 0.24), (0.76, 0.76)), ((0.76, 0.24), (0.24, 0.76))):
-        d.line([(a[0] * S, a[1] * S), (b[0] * S, b[1] * S)], fill=255, width=w)
-        for x, y in (a, b):
-            d.ellipse((x * S - w / 2, y * S - w / 2, x * S + w / 2, y * S + w / 2), fill=255)
-    return finish(im, size, size)
-
-
-def btn_circle(size):
-    im = mask_canvas(size, size)
-    S = size * SS
-    ImageDraw.Draw(im).ellipse((0.20 * S, 0.20 * S, 0.80 * S, 0.80 * S), outline=255, width=int(0.12 * S))
-    return finish(im, size, size)
-
-
-def btn_square(size):
-    im = mask_canvas(size, size)
-    S = size * SS
-    ImageDraw.Draw(im).rounded_rectangle((0.22 * S, 0.22 * S, 0.78 * S, 0.78 * S), radius=int(0.06 * S),
-                                         outline=255, width=int(0.12 * S))
-    return finish(im, size, size)
-
-
-def btn_triangle(size):
-    im = mask_canvas(size, size)
-    d = ImageDraw.Draw(im)
-    S = size * SS
-    pts = [(0.50 * S, 0.17 * S), (0.84 * S, 0.77 * S), (0.16 * S, 0.77 * S)]
-    w = int(0.12 * S)
-    d.line(pts + [pts[0], pts[1]], fill=255, width=w, joint='curve')
-    for x, y in pts:
-        d.ellipse((x - w / 2, y - w / 2, x + w / 2, y + w / 2), fill=255)
-    return finish(im, size, size)
-
-
-ICON_SPECS = [
-    ('HERO', lambda: icon_headphones(88)),
-    ('ROWHP', lambda: icon_headphones(30)),
-    ('GLOW', lambda: icon_glow(230)),
-    ('CHECK', lambda: icon_check(26)),
-    ('BANG', lambda: icon_bang(26)),
-    ('XMARK', lambda: icon_cross_mark(26)),
-    ('SPEAKER', lambda: icon_speaker(26)),
-    ('BCROSS', lambda: btn_cross(22)),
-    ('BCIRCLE', lambda: btn_circle(22)),
-    ('BSQUARE', lambda: btn_square(22)),
-    ('BTRI', lambda: btn_triangle(22)),
+# SVG paths from the approved screen, shared across sizes in the native atlas.
+HEADPHONES = ('<path d="M3 14v-2a9 9 0 0 1 18 0v2'
+              'M3 14a2 2 0 0 1 2-2h1a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2Z'
+              'm18 0a2 2 0 0 0-2-2h-1a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h1a2 2 0 0 0 2-2Z"/>')
+SPEAKER = '<rect x="6" y="3" width="12" height="18" rx="3"/><path d="M12 7h.01"/><circle cx="12" cy="14" r="2.5"/>'
+PANEL_ICONS = [
+    ('HERO', 42, HEADPHONES),
+    ('HERO_SPEAKER', 42, SPEAKER),
+    ('ROWHP', 23, HEADPHONES),
+    ('DISPLAY', 22, '<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8m-4-4v4"/>'),
+    ('LOUDSPEAKER', 23, SPEAKER),
+    ('CHECK', 23, '<path d="m6 12 4 4 8-8"/>'),
+    ('BANG', 20, '<path d="M12 5v9m0 5h.01"/>'),
+    ('DOWNLOAD', 21, '<path d="M12 4v15m-5-5 5 5 5-5"/>'),
 ]
+BUTTON_ICONS = [
+    ('BCROSS', '<path d="m4 4 8 8m0-8-8 8"/>'),
+    ('BCIRCLE', '<circle cx="8" cy="8" r="4.5"/>'),
+    ('BSQUARE', '<rect x="3.5" y="3.5" width="9" height="9" rx=".6"/>'),
+    ('BTRI', '<path d="M8 3.5 13 12.5H3Z"/>'),
+]
+
+
+def icon_mask(body, width, height, view_box, stroke):
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{view_box}">'
+           f'<g fill="none" stroke="#fff" stroke-width="{stroke}" stroke-linecap="round" '
+           f'stroke-linejoin="round">{body}</g></svg>')
+    with Image.open(BytesIO(svg_to_bytes(svg_string=svg))) as image:
+        return image.getchannel('A')
+
+
+def build_icons():
+    icons = {
+        name: icon_mask(body, size, size, '0 0 24 24', 1.65)
+        for name, size, body in PANEL_ICONS
+    }
+    for name, body in BUTTON_ICONS:
+        icons[name] = icon_mask(body, 15, 15, '0 0 16 16', 1.55)
+    icons['BUPDOWN'] = icon_mask(
+        '<path d="M5 12V4m-2.5 2.5L5 4l2.5 2.5M14 4v8m-2.5-2.5L14 12l2.5-2.5"/>',
+        18, 16, '0 0 18 16', 1.2)
+    dismiss = Image.new('L', (34, 15))
+    dismiss.paste(icons['BCROSS'], (0, 0))
+    dismiss.paste(icons['BCIRCLE'], (19, 0))
+    icons['DISMISS'] = dismiss
+    return icons
 
 
 # --- Brand artwork -----------------------------------------------------------
 def render_svg(name, mode, **size):
-    png = svg_to_bytes(svg_path=str(art / name), skip_system_fonts=True, **size)
+    png = svg_to_bytes(svg_path=str(art / name), skip_system_fonts=True,
+                       font_files=[str(FONT)], **size)
     with Image.open(BytesIO(png)) as image:
         return image.convert(mode)
 
 
 def build_icon512():
     mark = render_svg('btaudio4-logo.svg', 'RGBA', width=336, height=336)
-    icon = Image.new('RGB', (512, 512), '#0e1624')
+    icon = Image.new('RGB', (512, 512), '#09090b')
     icon.paste(mark, (88, 88), mark.getchannel('A'))
     return icon
 
 
 def build_data():
-    faces = {name: build_face(path, size) for name, path, size in FACES}
-    icons = {name: fn() for name, fn in ICON_SPECS}
-    logo = render_svg('btaudio4-logo.svg', 'RGBA')
+    faces = {name: build_face(*spec) for name, *spec in FACES}
+    icons = build_icons()
+    logo = render_svg('btaudio4-logo.svg', 'RGBA', width=25, height=25)
     splash = render_svg('btaudio4-launch-splash.svg', 'RGB')
     return dict(faces=faces, icons=icons, icon512=build_icon512(), logo=logo, splash=splash)
 
@@ -242,14 +144,14 @@ def write_headers(data):
     lines = ['/* Generated by native/make_assets.py - do not edit. */',
              'struct glyph{unsigned off;unsigned short adv16;unsigned char w,h;signed char bx,by;};',
              'struct face{const struct glyph*g;const unsigned char*bits;int asc,line;};']
-    for name, _, _ in FACES:
+    for name in data['faces']:
         f = data['faces'][name]
         lines.append(f'static const unsigned char fb_{name}[]={{' + ','.join(map(str, f['bits'])) + '};')
         rows = ','.join('{%d,%d,%d,%d,%d,%d}' % g for g in f['glyphs'])
         lines.append(f'static const struct glyph fg_{name}[95]={{{rows}}};')
-    lines.append('enum{' + ','.join(f'F_{n}' for n, _, _ in FACES) + ',F_COUNT};')
+    lines.append('enum{' + ','.join(f'F_{n}' for n in data['faces']) + ',F_COUNT};')
     lines.append('static const struct face FACES[F_COUNT]={' + ','.join(
-        '{fg_%s,fb_%s,%d,%d}' % (n, n, data['faces'][n]['asc'], data['faces'][n]['line']) for n, _, _ in FACES) + '};')
+        '{fg_%s,fb_%s,%d,%d}' % (n, n, f['asc'], f['line']) for n, f in data['faces'].items()) + '};')
     (out / 'ui_font.h').write_text('\n'.join(lines) + '\n')
 
     lines = ['/* Generated by native/make_assets.py - do not edit. */',
@@ -260,7 +162,8 @@ def write_headers(data):
     lines.append('static const struct icon ICONS[I_COUNT]={' + ','.join(
         '{ia_%s,%d,%d}' % (n, im.width, im.height) for n, im in data['icons'].items()) + '};')
     logo = data['logo']
-    vals = [(a << 24) | (r << 16) | (g << 8) | b for (r, g, b, a) in logo.getdata()]
+    pixels = iter(logo.tobytes())
+    vals = [(a << 24) | (r << 16) | (g << 8) | b for r, g, b, a in zip(pixels, pixels, pixels, pixels)]
     lines.append(f'#define LOGO_W {logo.width}\n#define LOGO_H {logo.height}')
     lines.append('static const unsigned int logo_argb[LOGO_W*LOGO_H]={' + ','.join(map(str, vals)) + '};')
     (out / 'ui_icons.h').write_text('\n'.join(lines) + '\n')
@@ -272,6 +175,6 @@ if __name__ == '__main__':
     d = build_data()
     write_headers(d)
     print('Native assets generated:', out)
-    for n, _, _ in FACES:
-        print('  face', n, len(d['faces'][n]['bits']), 'bytes')
+    for name, face in d['faces'].items():
+        print('  face', name, len(face['bits']), 'bytes')
     print('  icons', len(d['icons']), ' logo', d['logo'].size)

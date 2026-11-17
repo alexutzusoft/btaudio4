@@ -3,7 +3,8 @@
  *   cl /nologo /O2 /TC /I build\native /Fe:host_ui.exe native\host_ui.c
  *   host_ui scene.txt out.ppm
  * scene.txt is key=value lines (see apply()). Addresses are truncated to the host's
- * 32-bit `unsigned long`; scenes use addresses that stay distinct after that. */
+ * 32-bit `unsigned long`; scenes use addresses that stay distinct after that.
+ * Device rows accept dev=name|address[,class], with both numbers hexadecimal. */
 #include "ui.h"
 
 static int pinmode,pin_digit;
@@ -46,7 +47,10 @@ static void apply(const char*k,const char*v){
  else if(!strcmp(k,"dev")){
   struct bt_device*d=&state.devices[state.count];const char*bar=strrchr(v,'|');if(!bar||state.count>=BT_DEVICE_LIMIT)return;
   size_t n=(size_t)(bar-v);if(n>95)n=95;memcpy(d->name,v,n);d->name[n]=0;
-  d->address=(unsigned long)strtoull(bar+1,0,16);state.count++;
+  char*end;
+  d->address=(unsigned long)strtoull(bar+1,&end,16);
+  if(*end==',')d->cod=(unsigned)strtoul(end+1,NULL,16);
+  state.count++;
  }
 }
 int main(int argc,char**argv){

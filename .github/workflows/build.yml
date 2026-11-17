@@ -23,7 +23,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $match = [regex]::Match((Get-Content -Raw src/version.h), '#define\s+BTA_VERSION\s+"(\d+\.\d+\.\d+)"')
+          $match = [regex]::Match((Get-Content -Raw src/version.h), '#define\s+BTA_VERSION\s+"(\d+\.\d+(?:\.\d+)?)"')
           if (-not $match.Success) { throw 'Could not read BTA_VERSION from src/version.h.' }
           $version = $match.Groups[1].Value
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
@@ -37,7 +37,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Python dependencies
-        run: python -m pip install --upgrade pip pillow matplotlib resvg-py==0.5.0
+        run: python -m pip install --upgrade pip pillow resvg-py==0.5.0
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4

@@ -10,9 +10,9 @@ Requirements: jailbroken PS4, **GoldHEN** with **FTP (port 2121)** and **BinLoad
 
 ### Option A: Home-screen app (PKG)
 
-`BTAudio4-1.8.1.pkg` installs **BTAudio4** (`BTAD00001`) and bundles the payload.
+`BTAudio4-1.9.pkg` installs **BTAudio4** (`BTAD00001`) and bundles the payload.
 
-1. Copy `BTAudio4-1.8.1.pkg` to `/data/pkg/BTAudio4-1.8.1.pkg` via FTP (or install from USB).
+1. Copy `BTAudio4-1.9.pkg` to `/data/pkg/BTAudio4-1.9.pkg` via FTP (or install from USB).
 2. On the PS4, open **GoldHEN → Debug Settings → Package Installer** and install the PKG. If asked whether you want to continue installing, select **Yes**.
 3. Ensure **BinLoader (port 9090)** is enabled, then launch **Bluetooth Audio** from the home screen.
 
@@ -23,13 +23,13 @@ On launch, the app checks the running payload via `GET /api/version` and replace
 Send the flat payload directly from your PC (do not open a bare connection to port 9090, as BinLoader only accepts one payload per jailbreak):
 
 ```powershell
-python tools/deploy_variant.py build/BTAudio4-1.8.1.bin --host <PS4_IP> --connect
+python tools/deploy_variant.py build/BTAudio4-1.9.bin --host <PS4_IP> --connect
 ```
 
 Optional GoldHEN AutoRun install:
 
 ```powershell
-python tools/install_bta.py --host <PS4_IP> --payload build/BTAudio4-1.8.1.bin
+python tools/install_bta.py --host <PS4_IP> --payload build/BTAudio4-1.9.bin
 python tools/install_bta.py --host <PS4_IP> --disable-autorun   # undo
 ```
 
@@ -48,8 +48,8 @@ Put your headphones in pairing mode, then pair and connect using either:
 
 | Path | Description |
 |---|---|
-| `build/BTAudio4-1.8.1.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
-| `build/BTAudio4-1.8.1.bin` | Built flat payload |
+| `build/BTAudio4-1.9.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
+| `build/BTAudio4-1.9.bin` | Built flat payload |
 | `src/payload/` | Payload source (launcher, A2DP worker, web UI, dynamic kernel resolver, device cache, BT accept patch) |
 | `src/native/` | OpenOrbis home-screen app source and asset generator |
 | `src/native/art/` | SVG sources for the native logo, home-screen icon, and launch splash |
@@ -60,16 +60,16 @@ Put your headphones in pairing mode, then pair and connect using either:
 Requires `..\toolchain` beside the repo (`toolchain/llvm/bin` and `toolchain/OpenOrbis/PS4Toolchain`), Python 3.10 or newer, and .NET for `PkgTool.Core`:
 
 ```powershell
-python -m pip install pillow matplotlib resvg-py==0.5.0
-powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTAudio4-1.8.1.bin
-powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/BTAudio4-1.8.1.pkg
+python -m pip install pillow resvg-py==0.5.0
+powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTAudio4-1.9.bin
+powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/BTAudio4-1.9.pkg
 ```
 
 ## Credits & Licenses
 
 - u/YoxScorpion for testing with QCY H3 headphones and reporting audio latency and DVD TV mute issues.
 - u/Party-Chance-4125 for testing multiple Bluetooth audio devices and reporting audio dropouts in games.
-- Font assets: DejaVu (`src/native/LICENSE_DEJAVU.txt`).
+- Font assets: Inter (`src/native/art/Inter-OFL.txt`).
 - AutoRun entry format: documented in [orbisRPC](https://github.com/SirHumza/orbisRPC/tree/main/installer).
 - Requires [GoldHEN](https://github.com/GoldHEN/GoldHEN) (not included).
 - The PKG bundles OpenOrbis sample modules (`libc.prx`, `libSceFios2.prx`, `right.sprx`) from [OpenOrbis-PS4-Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain).
