@@ -2,6 +2,7 @@
 #include "web_page.h"
 #include "protocol.h"
 #include "kresolve.h"
+#include "diag.h"
 #include "../version.h"
 int bta_apply_patch(void);
 
@@ -71,9 +72,11 @@ struct app{
  struct client clients[4];
  /* Buffered diagnostic log owned by the housekeeping worker. */
  char logbuf[3072];
- unsigned logused,log_dropped;
+ char logline[512];
+ unsigned logused,log_dropped,logline_used;
  int log_urgent,koff_logged,patch_logged,no_widen;
  u64 log_flush_at,log_urgent_at,log_file_bytes,health_at,health_warn_at,resync_warn_at;
+ struct diag_reporter diag;
  u64 bt_ev_last_at;u8 bt_ev_last_type,bt_ev_last_sub;u32 bt_ev_last_data;u64 bt_ev_last_addr;
  u32 health_resyncs,health_ok_skips;
  struct second health;
@@ -111,19 +114,46 @@ static void copy_audio_stats(struct app*a,const struct audio_stats*s){
  a->ok_at=s->ok_at;a->refused_since=s->refused_since;a->last_rc=s->last_rc;a->other_rc=s->other_rc;
  a->level=s->level;a->meter_peak=s->meter_peak;
 }
-__attribute__((noinline)) static void wlog_raw(struct app*a,const char*s){while(*s&&a->logused+1<sizeof(a->logbuf))a->logbuf[a->logused++]=*s++;a->logbuf[a->logused]=0;}
+static void wlog_flush(struct app*a,u64 now,int force){
+ char tmp[3072];unsigned n=0;
+ if(a->logused){
+  int due=force||(a->logused>=1536)||(a->log_urgent&&now>=a->log_urgent_at)||(now>=a->log_flush_at);
+  if(due){n=a->logused;memcpy(tmp,a->logbuf,n);a->logused=0;a->log_urgent=0;a->log_flush_at=now+15000000;a->log_urgent_at=now+2000000;}
+ }
+ if(!n)return;
+ if(a->log_file_bytes>=WORKER_LOG_MAX){sc3(128,(long)WORKER_LOG,(long)WORKER_LOG_PREV,0);a->log_file_bytes=0;}
+ long fd=sc3(5,(long)WORKER_LOG,0x209,0644);
+ if(fd>=0){long w=sc3(4,fd,(long)tmp,n);closefd(fd);if(w>0)a->log_file_bytes+=(u64)w;}
+}
+__attribute__((noinline)) static void wlog_raw(struct app*a,const char*s){while(*s&&a->logline_used+2<sizeof(a->logline))a->logline[a->logline_used++]=*s++;a->logline[a->logline_used]=0;}
 __attribute__((noinline)) static void wlog_dec(struct app*a,long n){char b[24];unsigned i=0;u64 v;if(n<0){wlog_raw(a,"-");v=0-(u64)n;}else v=(u64)n;do{b[i++]=(char)('0'+v%10);v/=10;}while(v);while(i){char s[2]={b[--i],0};wlog_raw(a,s);}}
 __attribute__((noinline)) static void wlog_hex(struct app*a,u64 v){const char*h="0123456789abcdef";wlog_raw(a,"0x");char b[16];int i=0;do{b[i++]=h[v&15];v>>=4;}while(v);while(i){char s[2]={b[--i],0};wlog_raw(a,s);}}
 __attribute__((noinline)) static void wlog_mac(struct app*a,u64 mac){const char*h="0123456789ABCDEF";for(int i=0;i<12;i++){char s[2]={h[(mac>>(44-4*i))&15],0};wlog_raw(a,s);}}
 __attribute__((noinline)) static void wlog_str(struct app*a,const char*s){wlog_raw(a,"\"");for(unsigned i=0;s[i]&&i<80;i++){char c=s[i];if(c=='"'||c=='\\')wlog_raw(a,"\\");char b[2]={(c>=32&&c<127)?c:'?',0};wlog_raw(a,b);}wlog_raw(a,"\"");}
 __attribute__((noinline)) static int wlog_begin(struct app*a,u64 now,const char*tag){
- if(sizeof(a->logbuf)-a->logused<280){a->log_dropped++;return 0;}
- if(a->log_dropped){wlog_raw(a,"[dropped=");wlog_dec(a,(long)a->log_dropped);wlog_raw(a,"]\n");a->log_dropped=0;}
+ a->logline_used=0;a->logline[0]=0;
  u64 tenths=now/100000;
  wlog_raw(a,"[+");wlog_dec(a,(long)(tenths/10));wlog_raw(a,".");wlog_dec(a,(long)(tenths%10));wlog_raw(a,"s] ");wlog_raw(a,tag);wlog_raw(a,": ");
  return 1;
 }
-__attribute__((noinline)) static void wlog_end(struct app*a,int urgent){wlog_raw(a,"\n");if(urgent)a->log_urgent=1;}
+__attribute__((noinline)) static void wlog_end(struct app*a,int urgent){
+ if(a->logline_used+1<sizeof(a->logline)){a->logline[a->logline_used++]='\n';a->logline[a->logline_used]=0;}
+ diag_push(&a->diag,a->logline,a->logline_used);
+ if(sizeof(a->logbuf)-a->logused<a->logline_used+32)wlog_flush(a,a->clock(),1);
+ if(sizeof(a->logbuf)-a->logused>=a->logline_used+32){
+  if(a->log_dropped){
+   unsigned prev=a->log_dropped;a->log_dropped=0;
+   const char*p="[dropped=";while(*p&&a->logused+1<sizeof(a->logbuf))a->logbuf[a->logused++]=*p++;
+   char b[24];unsigned i=0;u64 v=prev;do{b[i++]=(char)('0'+v%10);v/=10;}while(v);
+   while(i&&a->logused+1<sizeof(a->logbuf))a->logbuf[a->logused++]=b[--i];
+   const char*s="]\n";while(*s&&a->logused+1<sizeof(a->logbuf))a->logbuf[a->logused++]=*s++;
+  }
+  memcpy(a->logbuf+a->logused,a->logline,a->logline_used);
+  a->logused+=a->logline_used;
+  a->logbuf[a->logused]=0;
+ }else a->log_dropped++;
+ if(urgent)a->log_urgent=1;
+}
 __attribute__((noinline)) static void wlog_koff(struct app*a,u64 now,int force){
  const struct bt_koff*k=bt_koff_info();
  if(!k||(!force&&a->koff_logged&&k->valid))return;
@@ -142,17 +172,6 @@ __attribute__((noinline)) static void wlog_koff(struct app*a,u64 now,int force){
   wlog_raw(a," pol=");wlog_hex(a,k->conn_policy_off);wlog_raw(a," hdl=");wlog_hex(a,k->conn_handle_off);
   wlog_end(a,0);
  }
-}
-static void wlog_flush(struct app*a,u64 now,int force){
- char tmp[3072];unsigned n=0;
- if(a->logused){
-  int due=force||(a->logused>=1536)||(a->log_urgent&&now>=a->log_urgent_at)||(now>=a->log_flush_at);
-  if(due){n=a->logused;memcpy(tmp,a->logbuf,n);a->logused=0;a->log_urgent=0;a->log_flush_at=now+15000000;a->log_urgent_at=now+2000000;}
- }
- if(!n)return;
- if(a->log_file_bytes>=WORKER_LOG_MAX){sc3(128,(long)WORKER_LOG,(long)WORKER_LOG_PREV,0);a->log_file_bytes=0;}
- long fd=sc3(5,(long)WORKER_LOG,0x209,0644);
- if(fd>=0){long w=sc3(4,fd,(long)tmp,n);closefd(fd);if(w>0)a->log_file_bytes+=(u64)w;}
 }
 static void message(struct app*a,const char*s){memset(a->message,0,sizeof(a->message));u64 n=length(s);if(n>127)n=127;memcpy(a->message,s,n);}
 /* pre + device name (clipped to 40 bytes) + suf, always NUL-terminated within cap. */
@@ -788,6 +807,9 @@ static unsigned status(struct app*a,char*out,unsigned cap){
  u64 now=a->clock();
  struct writer w={out,0,cap};append(&w,"{\"version\":\"" BTA_VERSION "\",\"message\":");quoted(&w,a->message);field(&w,"sender",a->sender_alive);field(&w,"sender_prio",__atomic_load_n(&a->sender_prio,__ATOMIC_RELAXED));field(&w,"thread_rc",a->thread_rc);field(&w,"prio_rc",a->prio_rc);field(&w,"aff_rc",a->aff_rc);field(&w,"pi_rc",a->pi_rc);
  field(&w,"volume",a->volume);field(&w,"volume_synced",a->volume_synced);field(&w,"wanted",a->wanted);field(&w,"streaming",a->streaming);field(&w,"tv_enabled",a->tv);field(&w,"joint",a->joint);field(&w,"send_type",a->joint?4:3);field(&w,"relinks",a->relinks_total);field(&w,"refused_ms",a->refused_since?(long)((now-a->refused_since)/1000):0);field(&w,"hdmi_muted",a->muted==1);field(&w,"scanning",a->scanning);field(&w,"pin_pending",a->pin_pending);field(&w,"test",now<a->test_until);field(&w,"link",link_state(a));field(&w,"attempts",a->attempts);field(&w,"retry_ms",retry_in_ms(a,now));field(&w,"meter",a->meter);field(&w,"quiet_ms",quiet_for_ms(a,now));field(&w,"level",a->level);field(&w,"packets",a->packets);field(&w,"errors",a->errors);field(&w,"resyncs",a->resyncs);field(&w,"patch_rc",a->patch_rc);field(&w,"packet_rc",a->packet_rc);field(&w,"connect_rc",a->connect_rc);field(&w,"audio_rc",a->last_rc);field(&w,"hdmi_rc",a->hdmi_rc);field(&w,"bt_state",a->btstate);field(&w,"no_widen",a->no_widen);field(&w,"bitpool",a->bp_cur);field(&w,"kdrops",a->bp_last_drops);field(&w,"uptime_us",a->clock());field(&w,"list_rc",a->list_rc);
+ field(&w,"diag_sent",(long)__atomic_load_n(&a->diag.sent_bytes,__ATOMIC_RELAXED));
+ field(&w,"diag_chunks",(long)__atomic_load_n(&a->diag.sent_chunks,__ATOMIC_RELAXED));
+ field(&w,"diag_failed",(long)__atomic_load_n(&a->diag.failed_sends,__ATOMIC_RELAXED));
  char mac[13];mac_text(a->target.address,mac);append(&w,",\"selected\":");quoted(&w,mac);append(&w,",\"name\":");quoted(&w,a->target.name);
  append(&w,",\"devices\":[");int first=1;
  for(unsigned i=0;i<a->devices.count;i++){struct bt_device*d=&a->devices.items[i];if(!bt_is_audio(d)&&d->address!=a->target.address)continue;
@@ -1024,6 +1046,7 @@ void*bta_worker(void*arg){
  {u64 t0=a.clock();
   struct{u64 size;char text[28];unsigned version;}sw={.size=40};int(*getver)(void*)=0;unsigned swv=0;
   if(!resolve("sceKernelGetSystemSwVersion",&getver)&&getver&&!getver(&sw)){sw.text[27]=0;swv=sw.version;}
+  diag_init(&a.diag,a.sleep,a.clock,a.map,a.unmap,swv?sw.text:"unknown");
   if(wlog_begin(&a,t0,"worker_start")){
    wlog_raw(&a,"v=" BTA_VERSION " fw=");wlog_str(&a,swv?sw.text:"unknown");wlog_raw(&a," fw_hex=");wlog_hex(&a,swv);
    wlog_raw(&a," hdmi_fd=");wlog_dec(&a,a.hdmi);wlog_raw(&a," tv=");wlog_dec(&a,a.tv);
@@ -1088,6 +1111,7 @@ void*bta_worker(void*arg){
   wlog_raw(&a," relinks=");wlog_dec(&a,(long)a.relinks_total);wlog_end(&a,1);
  }
  wlog_flush(&a,a.clock(),1);
+ diag_stop(&a.diag);
  if(a.cond_rc==0)a.destroy_cond(&a.audio_cond);
  if(a.destroy_mutex)a.destroy_mutex(&a.mutex);
  for(int i=0;i<4;i++)closefd(a.clients[i].fd);

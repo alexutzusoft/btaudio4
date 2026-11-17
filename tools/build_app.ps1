@@ -14,7 +14,7 @@ $array = ($html | ForEach-Object { $_.ToString() }) -join ','
 [IO.File]::WriteAllText((Join-Path $build 'web_page.h'), "static const char web_page[] = {$array,0};")
 $flags = @('--target=x86_64-pc-freebsd12-elf','-O2','-fPIE','-ffreestanding','-fno-builtin','-fno-stack-protector','-mno-red-zone','-fno-asynchronous-unwind-tables','-Wall','-Wextra','-Werror','-I', $build)
 $objects = @()
-foreach ($name in @('launcher','worker')) {
+foreach ($name in @('launcher','worker','diag')) {
     $obj = Join-Path $build "$name.o"
     & $clang @flags -c (Join-Path $root "src/payload/$name.c") -o $obj
     if ($LASTEXITCODE) { throw "Compile failed: $name" }

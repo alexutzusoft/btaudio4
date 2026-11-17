@@ -11,7 +11,8 @@ $verMatch = [regex]::Match((Get-Content -Raw (Join-Path $root 'src/version.h')),
 if (-not $verMatch.Success) { throw 'Could not parse BTA_VERSION from src/version.h' }
 $ver = $verMatch.Groups[1].Value
 $verParts = $ver.Split('.')
-$sfoVer = '{0:D2}.{1:D2}' -f [int]$verParts[0], ([int]$verParts[1] * 10 + ($(if ($verParts.Count -gt 2) { [int]$verParts[2] } else { 0 })))
+$minor = if ($verParts.Count -gt 2) { [int]$verParts[1] * 10 + [int]$verParts[2] } elseif ($verParts[1].Length -eq 1) { [int]$verParts[1] * 10 } else { [int]$verParts[1] }
+$sfoVer = '{0:D2}.{1:D2}' -f [int]$verParts[0], $minor
 $env:DOTNET_ROLL_FORWARD = 'Major'
 $env:OO_PS4_TOOLCHAIN = $sdk
 python (Join-Path $root 'src/native/make_assets.py')
