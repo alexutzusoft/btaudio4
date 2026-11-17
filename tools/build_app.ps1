@@ -37,6 +37,11 @@ $objects += $obj
 $script = Join-Path $root 'src/payload/payload.ld'
 & $linker -T $script @objects -o (Join-Path $build 'BTA-Audio.debug.elf')
 if ($LASTEXITCODE) { throw 'ELF link failed' }
-& $linker --oformat=binary -T $script @objects -o (Join-Path $root "build/BTAudio4-$ver.bin")
-if ($LASTEXITCODE) { throw 'Binary link failed' }
+$strip  = Join-Path $workspace 'toolchain/llvm/bin/llvm-strip.exe'
+$elfOut = Join-Path $build 'BTA-Audio.debug.elf'
+$binOut = Join-Path $root "build/BTAudio4-$ver.bin"
+& $linker -N -T $script @objects -o $elfOut
+if ($LASTEXITCODE) { throw 'ELF link (-N) failed' }
+& $strip --strip-all -o $binOut $elfOut
+if ($LASTEXITCODE) { throw 'llvm-strip failed' }
 Write-Output "Built build/BTAudio4-$ver.bin"
