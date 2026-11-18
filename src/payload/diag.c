@@ -408,10 +408,17 @@ static int query_dns_server(struct diag_reporter *d, const char *host, u32 dns_i
  return -1;
 }
 
+static int diag_stopping_expired(struct diag_reporter *d) {
+ return !__atomic_load_n(&d->run, __ATOMIC_ACQUIRE) && d->clock() >= d->stop_deadline;
+}
+
 static int resolve_host(struct diag_reporter *d, const char *host, u32 *ip_out) {
  if (!parse_ipv4(host, ip_out)) return 0;
+ if (!__atomic_load_n(&d->run, __ATOMIC_ACQUIRE)) return -1;
  if (!resolve_scenet(host, ip_out)) return 0;
+ if (diag_stopping_expired(d)) return -1;
  if (!query_dns_server(d, host, diag_htonl(0x01010101U), ip_out)) return 0;
+ if (diag_stopping_expired(d)) return -1;
  if (!query_dns_server(d, host, diag_htonl(0x08080808U), ip_out)) return 0;
  return -1;
 }
@@ -537,7 +544,7 @@ static int read_http_response(struct diag_reporter *d, long fd, int timeout_ms, 
 
 static int send_http_chunk(struct diag_reporter *d, const struct diag_url *u,
                            u32 ip, long *sock_io, const u8 *chunk, u32 len,
-                           u32 seq, u64 offset, int timeout_ms) {
+                           u32 seq, u64 offset, u64 dropped, int timeout_ms) {
  char hdr[1024];
  struct diag_writer w = {hdr, 0, sizeof(hdr)};
  dw_raw(&w, "POST ");
@@ -548,6 +555,7 @@ static int send_http_chunk(struct diag_reporter *d, const struct diag_url *u,
  dw_raw(&w, "&offset="); dw_u64(&w, offset);
  dw_raw(&w, "&version="); dw_url_enc(&w, BTA_VERSION);
  dw_raw(&w, "&fw="); dw_url_enc(&w, d->fw);
+ if (dropped) { dw_raw(&w, "&dropped="); dw_u64(&w, dropped); }
  dw_raw(&w, " HTTP/1.1\r\nHost: ");
  dw_raw(&w, u->host_hdr);
  dw_raw(&w, "\r\nUser-Agent: BTAudio4/" BTA_VERSION "\r\n"
@@ -568,6 +576,7 @@ static int send_http_chunk(struct diag_reporter *d, const struct diag_url *u,
    int code = read_http_response(d, *sock_io, timeout_ms, &ka);
    if (!ka) { closefd(*sock_io); *sock_io = -1; }
    if (code >= 200 && code < 300) return 0;
+   if (code == 400 || code == 413 || code == 414) return -3;
    if (code > 0) return -2; /* server rejected, do not immediately reconnect */
   }
   closefd(*sock_io);
@@ -577,8 +586,8 @@ static int send_http_chunk(struct diag_reporter *d, const struct diag_url *u,
  return -1;
 }
 
-static u32 copy_chunk(struct diag_reporter *d, u32 tail, u32 avail, u8 *out) {
- u32 len = avail > DIAG_CHUNK_MAX ? DIAG_CHUNK_MAX : avail;
+static u32 copy_chunk_max(struct diag_reporter *d, u32 tail, u32 avail, u8 *out, u32 max_len) {
+ u32 len = avail > max_len ? max_len : avail;
  u32 idx = tail & (d->cap - 1);
  u32 first = d->cap - idx;
  if (first >= len) {
@@ -587,7 +596,7 @@ static u32 copy_chunk(struct diag_reporter *d, u32 tail, u32 avail, u8 *out) {
   memcpy(out, d->ring + idx, first);
   memcpy(out + first, d->ring, len - first);
  }
- if (avail > DIAG_CHUNK_MAX) {
+ if (avail > max_len) {
   for (u32 k = len; k > len / 2; k--) {
    if (out[k - 1] == '\n') {
     len = k;
@@ -608,8 +617,11 @@ static void *diag_thread(void *arg) {
  u64 dns_at = 0;
  u32 cached_ip = 0;
  int has_ip = 0;
+ u32 consec_fails = 0;
  long sock = -1;
  u32 backoff_ms = 0;
+ u64 rep_drop_ev = 0;
+ u64 rep_drop_bytes = 0;
  u8 tx_buf[DIAG_CHUNK_MAX];
 
  for (;;) {
@@ -623,6 +635,7 @@ static void *diag_thread(void *arg) {
    if (!urls_equal(&url, &next_url)) {
     url = next_url;
     has_ip = 0;
+    consec_fails = 0;
     closefd(sock);
     sock = -1;
    }
@@ -635,19 +648,25 @@ static void *diag_thread(void *arg) {
 
   if (!running && avail == 0) break;
 
+  if (avail > 0 && __atomic_exchange_n(&d->urgent, 0, __ATOMIC_ACQ_REL)) {
+   u64 u = now + 150000ULL;
+   if (u < next_send) next_send = u;
+  }
+
   int due = !running || (avail >= DIAG_CHUNK_MAX) || (avail > 0 && now >= next_send);
   if (!due) {
-   d->sleep(200000);
+   d->sleep(avail > 0 ? 50000 : 200000);
    continue;
   }
 
-  if (!has_ip || (now - dns_at >= DIAG_DNS_TTL_US)) {
+  if (!has_ip || (running && now - dns_at >= DIAG_DNS_TTL_US)) {
    u32 ip = 0;
    if (!resolve_host(d, url.host, &ip)) {
     cached_ip = ip;
     has_ip = 1;
     dns_at = d->clock();
-   } else {
+    consec_fails = 0;
+   } else if (!has_ip) {
     has_ip = 0;
    }
   }
@@ -662,23 +681,46 @@ static void *diag_thread(void *arg) {
    continue;
   }
 
-  u32 len = copy_chunk(d, tail, avail, tx_buf);
+  u64 cur_drop_ev = __atomic_load_n(&d->dropped, __ATOMIC_RELAXED);
+  u64 cur_drop_bytes = __atomic_load_n(&d->dropped_bytes, __ATOMIC_RELAXED);
+  u32 prefix_len = 0;
+  if (cur_drop_ev > rep_drop_ev) {
+   struct diag_writer pw = {(char *)tx_buf, 0, 128};
+   dw_raw(&pw, "# [diag: dropped=");
+   dw_u64(&pw, cur_drop_ev - rep_drop_ev);
+   dw_raw(&pw, " bytes=");
+   dw_u64(&pw, cur_drop_bytes - rep_drop_bytes);
+   dw_raw(&pw, " total=");
+   dw_u64(&pw, cur_drop_ev);
+   dw_raw(&pw, "]\n");
+   prefix_len = pw.used;
+  }
+
+  u32 ring_len = copy_chunk_max(d, tail, avail, tx_buf + prefix_len, DIAG_CHUNK_MAX - prefix_len);
+  u32 total_len = prefix_len + ring_len;
   int timeout_ms = running ? 4000 : 1200;
-  int rc = send_http_chunk(d, &url, cached_ip, &sock, tx_buf, len,
-                           d->next_seq, d->sent_bytes, timeout_ms);
-  if (rc == 0) {
-   __atomic_store_n(&d->tail, tail + len, __ATOMIC_RELEASE);
+  int rc = send_http_chunk(d, &url, cached_ip, &sock, tx_buf, total_len,
+                           d->next_seq, d->sent_bytes, cur_drop_ev, timeout_ms);
+  if (rc == 0 || rc == -3) {
+   __atomic_store_n(&d->tail, tail + ring_len, __ATOMIC_RELEASE);
    d->next_seq++;
-   __atomic_store_n(&d->sent_bytes, d->sent_bytes + len, __ATOMIC_RELAXED);
-   __atomic_store_n(&d->sent_chunks, d->sent_chunks + 1, __ATOMIC_RELAXED);
-   backoff_ms = 0;
+   __atomic_store_n(&d->sent_bytes, d->sent_bytes + total_len, __ATOMIC_RELAXED);
+   rep_drop_ev = cur_drop_ev;
+   rep_drop_bytes = cur_drop_bytes;
+   if (rc == 0) {
+    __atomic_store_n(&d->sent_chunks, d->sent_chunks + 1, __ATOMIC_RELAXED);
+    backoff_ms = 0;
+    consec_fails = 0;
+   } else {
+    __atomic_fetch_add(&d->failed_sends, 1, __ATOMIC_RELAXED);
+   }
    u32 cur_head = __atomic_load_n(&d->head, __ATOMIC_ACQUIRE);
-   u32 rem = cur_head - (tail + len);
+   u32 rem = cur_head - (tail + ring_len);
    next_send = d->clock() + (rem > 0 ? 50000ULL : DIAG_INTERVAL_US);
    if (rem > 0 && running) d->sleep(50000);
   } else {
    __atomic_fetch_add(&d->failed_sends, 1, __ATOMIC_RELAXED);
-   has_ip = 0;
+   if (rc == -1 && ++consec_fails >= 3) has_ip = 0;
    closefd(sock);
    sock = -1;
    if (!running) break;
@@ -747,7 +789,7 @@ void diag_init(struct diag_reporter *d,
  d->alive = 1;
 }
 
-void diag_push(struct diag_reporter *d, const char *data, u32 len) {
+void diag_push_ex(struct diag_reporter *d, const char *data, u32 len, int urgent) {
  if (!d || !d->ring || !len || len >= d->cap) return;
  u32 tail = __atomic_load_n(&d->tail, __ATOMIC_ACQUIRE);
  u32 head = d->head;
@@ -755,6 +797,7 @@ void diag_push(struct diag_reporter *d, const char *data, u32 len) {
  u32 free_bytes = d->cap - used;
  if (free_bytes < len) {
   __atomic_fetch_add(&d->dropped, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&d->dropped_bytes, len, __ATOMIC_RELAXED);
   return;
  }
  u32 idx = head & (d->cap - 1);
@@ -766,12 +809,17 @@ void diag_push(struct diag_reporter *d, const char *data, u32 len) {
   memcpy(d->ring, data + first, len - first);
  }
  __atomic_store_n(&d->head, head + len, __ATOMIC_RELEASE);
+ if (urgent) __atomic_store_n(&d->urgent, 1, __ATOMIC_RELEASE);
+}
+
+void diag_push(struct diag_reporter *d, const char *data, u32 len) {
+ diag_push_ex(d, data, len, 0);
 }
 
 void diag_stop(struct diag_reporter *d) {
  if (!d) return;
  if (d->alive) {
-  d->stop_deadline = d->clock() + 1500000ULL;
+  d->stop_deadline = d->clock() + 2500000ULL;
   __atomic_store_n(&d->run, 0, __ATOMIC_RELEASE);
   d->join(d->thread, 0);
   d->alive = 0;

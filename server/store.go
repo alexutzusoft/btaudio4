@@ -24,6 +24,7 @@ const (
 type SessionMeta struct {
 	ClientID      string    `json:"client_id"`
 	SessionID     string    `json:"session_id"`
+	Kind          string    `json:"kind,omitempty"`
 	Version       string    `json:"version,omitempty"`
 	Firmware      string    `json:"fw,omitempty"`
 	RemoteIP      string    `json:"remote_ip,omitempty"`
@@ -31,20 +32,23 @@ type SessionMeta struct {
 	Chunks        uint64    `json:"chunks"`
 	LastSeq       uint64    `json:"last_seq"`
 	Gaps          uint64    `json:"gaps"`
+	ClientDropped uint64    `json:"client_dropped,omitempty"`
 	FirstSeen     time.Time `json:"first_seen"`
 	LastSeen      time.Time `json:"last_seen"`
 }
 
 // ChunkInput is a single diagnostic log chunk uploaded by the payload.
 type ChunkInput struct {
-	ClientID  string
-	SessionID string
-	Seq       uint64
-	Offset    uint64
-	Version   string
-	Firmware  string
-	RemoteIP  string
-	Data      []byte
+	ClientID      string
+	SessionID     string
+	Seq           uint64
+	Offset        uint64
+	Version       string
+	Firmware      string
+	Kind          string
+	ClientDropped uint64
+	RemoteIP      string
+	Data          []byte
 }
 
 // AppendResult summarizes how a chunk was applied to the session log.
@@ -292,6 +296,12 @@ func (s *Store) AppendChunk(in ChunkInput) (AppendResult, error) {
 	}
 	if ip := sanitizeText(in.RemoteIP, 64); ip != "" {
 		st.meta.RemoteIP = ip
+	}
+	if kind := sanitizeID(in.Kind, "", 16); kind != "" {
+		st.meta.Kind = kind
+	}
+	if in.ClientDropped > st.meta.ClientDropped {
+		st.meta.ClientDropped = in.ClientDropped
 	}
 	if st.meta.FirstSeen.IsZero() {
 		st.meta.FirstSeen = now

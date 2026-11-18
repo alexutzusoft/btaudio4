@@ -206,3 +206,43 @@ func TestIdleFileHandleEvictionAndReopen(t *testing.T) {
 		t.Fatalf("got %q, want %q", string(data), line1+line2)
 	}
 }
+
+func TestKindAndClientDroppedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	sv := NewServer(store, false)
+	ts := httptest.NewServer(sv)
+	defer ts.Close()
+
+	body := "[+0.1s] start: BinLoader (9090) unreachable\n"
+	url := fmt.Sprintf("%s/api/logs?client=c_app&session=app-012345&seq=1&offset=0&version=1.10&kind=app&dropped=4", ts.URL)
+	resp, err := http.Post(url, "text/plain; charset=utf-8", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	store.Close()
+
+	store2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore reload: %v", err)
+	}
+	defer store2.Close()
+
+	got, meta, err := store2.ReadLog("c_app", "app-012345", 0)
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("log=%q, want %q", string(got), body)
+	}
+	if meta.Kind != "app" || meta.ClientDropped != 4 || meta.Version != "1.10" {
+		t.Fatalf("unexpected meta: %+v", meta)
+	}
+}

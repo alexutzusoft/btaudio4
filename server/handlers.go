@@ -67,16 +67,19 @@ func (sv *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 	seq, _ := strconv.ParseUint(paramOrHeader(r, "seq", "X-BTA-Seq"), 10, 64)
 	offset, _ := strconv.ParseUint(paramOrHeader(r, "offset", "X-BTA-Offset"), 10, 64)
+	dropped, _ := strconv.ParseUint(paramOrHeader(r, "dropped", "X-BTA-Dropped"), 10, 64)
 
 	in := ChunkInput{
-		ClientID:  paramOrHeader(r, "client", "X-BTA-Client"),
-		SessionID: paramOrHeader(r, "session", "X-BTA-Session"),
-		Seq:       seq,
-		Offset:    offset,
-		Version:   paramOrHeader(r, "version", "X-BTA-Version"),
-		Firmware:  paramOrHeader(r, "fw", "X-BTA-FW"),
-		RemoteIP:  clientIP(r),
-		Data:      body,
+		ClientID:      paramOrHeader(r, "client", "X-BTA-Client"),
+		SessionID:     paramOrHeader(r, "session", "X-BTA-Session"),
+		Seq:           seq,
+		Offset:        offset,
+		Version:       paramOrHeader(r, "version", "X-BTA-Version"),
+		Firmware:      paramOrHeader(r, "fw", "X-BTA-FW"),
+		Kind:          paramOrHeader(r, "kind", "X-BTA-Kind"),
+		ClientDropped: dropped,
+		RemoteIP:      clientIP(r),
+		Data:          body,
 	}
 
 	res, err := sv.store.AppendChunk(in)
@@ -87,10 +90,11 @@ func (sv *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sv.verbose {
-		log.Printf("chunk client=%s session=%s seq=%d offset=%d bytes=%d received=%d dup=%v gap=%v ip=%s",
+		log.Printf("chunk client=%s session=%s kind=%s seq=%d offset=%d bytes=%d received=%d dup=%v gap=%v dropped=%d ip=%s",
 			sanitizeID(in.ClientID, "unknown", 64),
 			sanitizeID(in.SessionID, "default", 64),
-			in.Seq, in.Offset, len(body), res.BytesReceived, res.Duplicate, res.Gap, in.RemoteIP)
+			sanitizeID(in.Kind, "worker", 16),
+			in.Seq, in.Offset, len(body), res.BytesReceived, res.Duplicate, res.Gap, in.ClientDropped, in.RemoteIP)
 	}
 
 	writeJSON(w, http.StatusOK, struct {

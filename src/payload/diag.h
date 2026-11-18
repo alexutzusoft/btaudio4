@@ -4,7 +4,7 @@
 #include "runtime.h"
 
 #define DIAG_RING_SIZE 262144U
-#define DIAG_CHUNK_MAX 8192U
+#define DIAG_CHUNK_MAX 16384U
 #define DIAG_DEFAULT_HOST "bta.alexutzu.pro"
 #define DIAG_DEFAULT_PORT 80
 #define DIAG_URL_PATH_A "/data/bta_audio/diag_url"
@@ -17,10 +17,12 @@ struct diag_reporter {
  u32 head;
  u32 tail;
  u64 dropped;
+ u64 dropped_bytes;
  u64 sent_bytes;
  u64 sent_chunks;
  u64 failed_sends;
  u32 next_seq;
+ u32 urgent;
  int run;
  int alive;
  int exited;
@@ -44,6 +46,7 @@ void diag_init(struct diag_reporter *d,
                const char *fw_text);
 
 void diag_push(struct diag_reporter *d, const char *data, u32 len);
+void diag_push_ex(struct diag_reporter *d, const char *data, u32 len, int urgent);
 void diag_stop(struct diag_reporter *d);
 
 #endif

@@ -10,9 +10,9 @@ Requirements: jailbroken PS4, **GoldHEN** with **FTP (port 2121)** and **BinLoad
 
 ### Option A: Home-screen app (PKG)
 
-`BTAudio4-1.10.pkg` installs **BTAudio4** (`BTAD00001`) and bundles the payload.
+`BTAudio4-1.11.pkg` installs **BTAudio4** (`BTAD00001`) and bundles the payload.
 
-1. Copy `BTAudio4-1.10.pkg` to `/data/pkg/BTAudio4-1.10.pkg` via FTP (or install from USB).
+1. Copy `BTAudio4-1.11.pkg` to `/data/pkg/BTAudio4-1.11.pkg` via FTP (or install from USB).
 2. On the PS4, open **GoldHEN → Debug Settings → Package Installer** and install the PKG. If asked whether you want to continue installing, select **Yes**.
 3. Ensure **BinLoader (port 9090)** is enabled, then launch **Bluetooth Audio** from the home screen.
 
@@ -23,13 +23,13 @@ On launch, the app checks the running payload via `GET /api/version` and replace
 Send the flat payload directly from your PC (do not open a bare connection to port 9090, as BinLoader only accepts one payload per jailbreak):
 
 ```powershell
-python tools/deploy_variant.py build/BTAudio4-1.10.bin --host <PS4_IP> --connect
+python tools/deploy_variant.py build/BTAudio4-1.11.bin --host <PS4_IP> --connect
 ```
 
 Optional GoldHEN AutoRun install:
 
 ```powershell
-python tools/install_bta.py --host <PS4_IP> --payload build/BTAudio4-1.10.bin
+python tools/install_bta.py --host <PS4_IP> --payload build/BTAudio4-1.11.bin
 python tools/install_bta.py --host <PS4_IP> --disable-autorun   # undo
 ```
 
@@ -55,8 +55,8 @@ To help diagnose Bluetooth, kernel-offset, and audio-stuttering issues across di
 
 | Path | Description |
 |---|---|
-| `build/BTAudio4-1.10.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
-| `build/BTAudio4-1.10.bin` | Built flat payload |
+| `build/BTAudio4-1.11.pkg` | Built home-screen PKG (bundles `BTA-Audio.bin`) |
+| `build/BTAudio4-1.11.bin` | Built flat payload |
 | `src/payload/` | Payload source (launcher, A2DP worker, diagnostic reporter, web UI, dynamic kernel resolver, device cache, BT accept patch) |
 | `src/native/` | OpenOrbis home-screen app source and asset generator |
 | `src/native/art/` | SVG sources for the native logo, home-screen icon, and launch splash |
@@ -69,8 +69,8 @@ Requires `..\toolchain` beside the repo (`toolchain/llvm/bin` and `toolchain/Ope
 
 ```powershell
 python -m pip install pillow resvg-py==0.5.0
-powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTAudio4-1.10.bin
-powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/BTAudio4-1.10.pkg
+powershell -ExecutionPolicy Bypass -File tools/build_app.ps1      # builds build/BTAudio4-1.11.bin
+powershell -ExecutionPolicy Bypass -File tools/build_native.ps1   # builds build/BTAudio4-1.11.pkg
 ```
 
 ## Credits & Licenses
