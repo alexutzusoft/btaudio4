@@ -186,11 +186,33 @@ static u64 find_wrapper_before(u64 helper, u64 min_addr) {
     return 0;
 }
 
+static void kr_capture_dump(struct bt_koff *out, u64 addr, u64 lo, u64 hi, u32 want, u32 sub) {
+    if (!out || out->dump_len || !addr || lo >= hi) return;
+    if (addr < lo) addr = lo;
+    if (addr >= hi) return;
+    u64 avail = hi - addr;
+    u32 n = want > (u32)sizeof(out->dump_bytes) ? (u32)sizeof(out->dump_bytes) : want;
+    if ((u64)n > avail) n = (u32)avail;
+    const u8 *p = (const u8 *)addr;
+    for (u32 i = 0; i < n; i++) out->dump_bytes[i] = p[i];
+    out->dump_addr = addr;
+    out->dump_len = n;
+    out->dump_sub = sub;
+}
+
 static int scan_has_err(u64 start, u64 end) {
     static const s16 e1[] = {0xba, 0x01, 0x34, 0x2f, 0x80};
     static const s16 e3[] = {0xba, 0x03, 0x34, 0x2f, 0x80};
     return scan_first(start, end - start, e1, sizeof(e1) / sizeof(e1[0])) ||
            scan_first(start, end - start, e3, sizeof(e3) / sizeof(e3[0]));
+}
+
+u64 kr_find_bt_err_site(u64 rx_start, u64 rx_len) {
+    static const s16 e1[] = {0xba, 0x01, 0x34, 0x2f, 0x80};
+    static const s16 e3[] = {0xba, 0x03, 0x34, 0x2f, 0x80};
+    u64 hit = scan_first(rx_start, rx_len, e1, sizeof(e1) / sizeof(e1[0]));
+    if (hit) return hit;
+    return scan_first(rx_start, rx_len, e3, sizeof(e3) / sizeof(e3[0]));
 }
 
 static u64 kr_resolve_copyout_ex(u64 rx_start, u64 rx_len, u32 *hits_out) {
@@ -251,16 +273,25 @@ u64 kr_resolve_accept_site(u64 rx_start, u64 rx_len) {
 }
 
 static u64 resolve_lock_wrapper(u64 bt_start, u64 bt_len, const struct kr_range *ro, u32 n_ro,
-                                const char *name, struct bt_koff *out) {
+                                const char *name, struct bt_koff *out, u32 stage) {
+    u64 bt_end = bt_start + bt_len;
     u32 hits = 0;
     u64 s = find_str_unique_ex(ro, n_ro, name, &hits);
     if (!s) { out->fail_sub = 1; out->fail_aux = hits; return 0; }
     u64 ref = find_lea_ref(bt_start, bt_len, s);
     if (!ref) { out->fail_sub = 2; out->fail_aux = 0; return 0; }
     u64 helper = walk_prologue(ref, bt_start, 0x80);
-    if (!helper) { out->fail_sub = 3; out->fail_aux = 0; return 0; }
+    if (!helper) {
+        out->fail_sub = 3; out->fail_aux = 0;
+        kr_capture_dump(out, (ref > bt_start + 0x80) ? (ref - 0x80) : bt_start, bt_start, bt_end, 192, stage * 10 + 3);
+        return 0;
+    }
     u64 wrap = find_wrapper_before(helper, bt_start);
-    if (!wrap) { out->fail_sub = 4; out->fail_aux = 0; return 0; }
+    if (!wrap) {
+        out->fail_sub = 4; out->fail_aux = 0;
+        kr_capture_dump(out, (helper > bt_start + 0x80) ? (helper - 0x80) : bt_start, bt_start, bt_end, 192, stage * 10 + 4);
+        return 0;
+    }
     return wrap;
 }
 
@@ -268,16 +299,25 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
     static const s16 err_0b02[] = {0x41, 0xbd, 0x02, 0x0b, 0x2f, 0x80};
     static const s16 call_a[] = {0xbe, 0x0f, 0x04, 0x00, 0x00, 0x41, 0xb8, 0x18, 0x3c, 0x00, 0x00};
     static const s16 call_b[] = {0x41, 0xb8, 0x18, 0x3c, 0x00, 0x00, 0xbe, 0x0f, 0x04, 0x00, 0x00};
+    u64 bt_end = bt_start + bt_len;
 
     u32 hits = 0;
     u64 e = scan_unique_ex(bt_start, bt_len, err_0b02, sizeof(err_0b02) / sizeof(err_0b02[0]), &hits);
     if (!e) { out->fail_sub = 1; out->fail_aux = hits; return -1; }
     u64 cmd_fn = walk_prologue(e, bt_start, 0xe0);
-    if (!cmd_fn) { out->fail_sub = 2; out->fail_aux = 0; return -1; }
+    if (!cmd_fn) {
+        out->fail_sub = 2; out->fail_aux = 0;
+        kr_capture_dump(out, (e > bt_start + 0xc0) ? (e - 0xc0) : bt_start, bt_start, bt_end, 256, 62);
+        return -1;
+    }
 
     u64 c3c18 = scan_unique_ex(bt_start, bt_len, call_a, sizeof(call_a) / sizeof(call_a[0]), &hits);
     if (!c3c18) c3c18 = scan_unique_ex(bt_start, bt_len, call_b, sizeof(call_b) / sizeof(call_b[0]), &hits);
-    if (!c3c18) { out->fail_sub = 3; out->fail_aux = hits; return -1; }
+    if (!c3c18) {
+        out->fail_sub = 3; out->fail_aux = hits;
+        kr_capture_dump(out, cmd_fn, bt_start, bt_end, 256, 63);
+        return -1;
+    }
 
     /* Locate `lea rdx, [rip + disp32]` -> "22\0" near the 0x40f / 0x3c18 call setup. */
     u64 fmt = 0;
@@ -293,7 +333,11 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
             }
         }
     }
-    if (!fmt) { out->fail_sub = 4; out->fail_aux = 0; return -1; }
+    if (!fmt) {
+        out->fail_sub = 4; out->fail_aux = 0;
+        kr_capture_dump(out, (c3c18 > bt_start + 0x40) ? (c3c18 - 0x40) : bt_start, bt_start, bt_end, 192, 64);
+        return -1;
+    }
 
     /* Confirm control flow from c3c18 reaches cmd_fn (direct or via one short jmp). */
     u64 p = c3c18 + 11;
@@ -314,7 +358,11 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
         }
         p++;
     }
-    if (!confirmed) { out->fail_sub = 5; out->fail_aux = 0; return -1; }
+    if (!confirmed) {
+        out->fail_sub = 5; out->fail_aux = 0;
+        kr_capture_dump(out, (c3c18 > bt_start + 0x40) ? (c3c18 - 0x40) : bt_start, bt_start, bt_end, 192, 65);
+        return -1;
+    }
 
     /* Optionally refine policy/state offsets from the surrounding fn_3c18 function. */
     u64 fn3_start = walk_prologue(c3c18, bt_start, 0x180);
@@ -343,6 +391,7 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
             }
         }
         if (got == 15) out->resolved_mask |= KR_RES_CONN_LAYOUT;
+        else kr_capture_dump(out, fn3_start, bt_start, bt_end, 224, 91);
     }
 
     out->cmd_fn = cmd_fn;
@@ -468,16 +517,26 @@ static void resolve_audio_off(u64 bt_start, u64 bt_len, struct bt_koff *out) {
         }
         pos = hit + 1;
     }
+    /* Fallback: if audio drop block wasn't matched, dump around first `cmp eax, 5` or `idiv` in bt_start..end. */
+    u64 f_cmp = scan_first(bt_start, bt_len, cmp5_pat, 5);
+    if (f_cmp) {
+        kr_capture_dump(out, (f_cmp > bt_start + 0x40) ? (f_cmp - 0x40) : bt_start, bt_start, end, 224, 93);
+    }
 }
 
 static int resolve_cache_and_bounds(u64 bt_start, u64 bt_len, struct bt_koff *out) {
     static const s16 pat_3200[] = {0x41, 0xbd, 0x00, 0x32, 0x00, 0x00};
     static const s16 pat_0107[] = {0x41, 0xbc, 0x07, 0x01, 0x2f, 0x80};
 
+    u64 bt_end = bt_start + bt_len;
     u64 hit = scan_first(bt_start, bt_len, pat_3200, sizeof(pat_3200) / sizeof(pat_3200[0]));
     if (!hit) { out->fail_sub = 1; return -1; }
     u64 cache_fn = walk_prologue(hit, bt_start, 0xa0);
-    if (!cache_fn) { out->fail_sub = 2; return -1; }
+    if (!cache_fn) {
+        out->fail_sub = 2;
+        kr_capture_dump(out, (hit > bt_start + 0xa0) ? (hit - 0xa0) : bt_start, bt_start, bt_end, 224, 72);
+        return -1;
+    }
     out->cache_fn = cache_fn;
 
     /* Extract/verify cache array bounds & stride from name_lookup (0x802f0107) if matching. */
@@ -504,6 +563,8 @@ static int resolve_cache_and_bounds(u64 bt_start, u64 bt_len, struct bt_koff *ou
                 out->cache_end = c_end;
                 out->cache_stride = c_stride;
                 out->resolved_mask |= KR_RES_CACHE_BOUNDS;
+            } else {
+                kr_capture_dump(out, fn, bt_start, bt_end, 192, 92);
             }
         }
     }
@@ -517,6 +578,7 @@ static u64 resolve_ctx_ptr(u64 bt_start, u64 bt_len, const struct kr_range *ro, 
         0x48, 0x85, 0xc0,
         0x48, 0x89, 0x05, -1, -1, -1, -1
     };
+    u64 bt_end = bt_start + bt_len;
     u32 hits = 0;
     u64 s_drv = find_str_unique_ex(ro, n_ro, "SceBtDriver", &hits);
     if (!s_drv) { out->fail_sub = 1; out->fail_aux = hits; return 0; }
@@ -524,9 +586,17 @@ static u64 resolve_ctx_ptr(u64 bt_start, u64 bt_len, const struct kr_range *ro, 
     if (!ref_drv) { out->fail_sub = 2; out->fail_aux = 0; return 0; }
     u64 w = (ref_drv > bt_start + 0xa0) ? (ref_drv - 0xa0) : bt_start;
     u64 hit = scan_first(w, ref_drv - w, store_pat, sizeof(store_pat) / sizeof(store_pat[0]));
-    if (!hit) { out->fail_sub = 3; out->fail_aux = 0; return 0; }
+    if (!hit) {
+        out->fail_sub = 3; out->fail_aux = 0;
+        kr_capture_dump(out, w, bt_start, bt_end, 224, 83);
+        return 0;
+    }
     u64 ctx_ptr = (hit + 20) + (u64)(s64)rds32(hit + 16);
-    if ((ctx_ptr >> 48) != 0xffff) { out->fail_sub = 4; out->fail_aux = 0; return 0; }
+    if ((ctx_ptr >> 48) != 0xffff) {
+        out->fail_sub = 4; out->fail_aux = 0;
+        kr_capture_dump(out, (hit > bt_start + 0x20) ? (hit - 0x20) : bt_start, bt_start, bt_end, 128, 84);
+        return 0;
+    }
     return ctx_ptr;
 }
 
@@ -553,7 +623,15 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     if (!out->copyout_fn) { out->fail_stage = 2; out->fail_aux = hits; return -1; }
 
     u64 site = kr_resolve_accept_site_ex(rx_start, rx_len, &hits);
-    if (!site) { out->fail_stage = 3; out->fail_aux = hits; return -1; }
+    if (!site) {
+        out->fail_stage = 3; out->fail_aux = hits;
+        u64 err_site = kr_find_bt_err_site(rx_start, rx_len);
+        if (err_site) {
+            u64 da = (err_site > rx_start + 0x80) ? (err_site - 0x80) : rx_start;
+            kr_capture_dump(out, da, rx_start, rx_start + rx_len, 192, 30);
+        }
+        return -1;
+    }
     out->accept_site = site;
 
     u64 rx_end = rx_start + rx_len;
@@ -583,10 +661,10 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     out->stream_bitpool_off = 0x43d0;
     out->stream_enc_bp_off = 0x5c;
 
-    out->lock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_lock", out);
+    out->lock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_lock", out, 4);
     if (!out->lock_fn) { out->fail_stage = 4; return -1; }
 
-    out->unlock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_unlock", out);
+    out->unlock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_unlock", out, 5);
     if (!out->unlock_fn) { out->fail_stage = 5; return -1; }
 
     if (resolve_cmd_and_fmt(bt_start, bt_len, out)) { out->fail_stage = 6; return -1; }

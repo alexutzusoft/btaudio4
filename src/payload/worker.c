@@ -8,7 +8,7 @@ int bta_apply_patch(void);
 
 #define WORKER_LOG "/data/bta_audio/worker.log"
 #define WORKER_LOG_PREV "/data/bta_audio/worker.prev.log"
-#define WORKER_LOG_MAX 262144U
+#define WORKER_LOG_MAX 524288U
 
 /* Keep HDMI unmuted for this long after streaming starts so the system audio
  * mix that feeds /shm_acap.full actually activates, THEN apply the user's
@@ -19,7 +19,7 @@ static const short SINE32[32]={0,1561,3061,4445,5657,6652,7391,7846,8000,7846,73
 
 struct audio_req{u64 address;void*samples;u64 length;u32 mode,pad;};
 struct client{long fd;u64 deadline;u32 used,sent,total;char input[3072];char output[20000];};
-struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak,rc_full,rc_one,rc_other,maxref_ms,silent,maxsched_us,wp_moves;};
+struct second{u32 seq,t,pkts,refused,failed,late8,late16,late50,maxgap_us,maxsend_us,maxback_ms,peak,rc_full,rc_one,rc_other,maxref_ms,silent,maxsched_us,wp_moves,nonzero_pkts,nan_samples,clipped,min_avail,max_avail,zero_avail;};
 enum audio_fault{AUDIO_OK,AUDIO_RING_RESET,AUDIO_RELINK,AUDIO_LINK_LOST};
 struct audio_stats{
  u64 packets,errors,resyncs,ok_at,refused_since;
@@ -71,19 +71,21 @@ struct app{
  struct bt_device target;struct bt_devices devices;int scanning,pin_pending;u64 scan_end,list_at;
  struct client clients[4];
  /* Buffered diagnostic log owned by the housekeeping worker. */
- char logbuf[3072];
- char logline[1024];
+ char logbuf[4096];
+ char logline[1536];
  unsigned logused,log_dropped,logline_used;
- int log_urgent,logline_trunc,koff_logged,patch_logged,no_widen;
+ int log_urgent,logline_trunc,koff_logged,patch_logged,no_widen,prev_phase;
  u64 log_flush_at,log_urgent_at,log_file_bytes,health_at,health_warn_at,resync_warn_at;
+ u64 phase_at,koff_err_at,net_drop_at,shm_probe_at,full_diag_at,http_seen_mask;
  struct diag_reporter diag;
  u64 dev_hash;
  u64 bt_ev_last_at,bt_ev_suppressed;u8 bt_ev_last_type,bt_ev_last_sub;u32 bt_ev_last_data;u64 bt_ev_last_addr;
- u32 health_resyncs,health_ok_skips;
+ u32 health_resyncs,health_ok_skips,net_drop_suppressed;
  struct second health;
  u64 bp_check_at,bp_adapt_at,bp_stable_at,bp_err_at,shm_stall_at,http_rej_at;
  u32 bp_last_drops,bp_health_drops,bp_ten_drops,bp_win[8],shm_stall_wp,http_rej_suppressed;
- int bp_target,bp_base,bp_cur,bp_inflight,bp_init_logged,shm_stall_warned;
+ int bp_target,bp_base,bp_cur,bp_inflight,bp_init_logged,shm_stall_warned,shm_silence_sec,full_diag_on_bad;
+ int diag_last_err,diag_last_code,load_target_rc,load_vol_rc;
  u8 bp_win_idx;
 };
 static void lock_state(struct app*a){if(a->mlock)a->mlock(&a->mutex);}
@@ -116,9 +118,9 @@ static void copy_audio_stats(struct app*a,const struct audio_stats*s){
  a->level=s->level;a->meter_peak=s->meter_peak;
 }
 static void wlog_flush(struct app*a,u64 now,int force){
- char tmp[3072];unsigned n=0;
+ char tmp[4096];unsigned n=0;
  if(a->logused){
-  int due=force||(a->logused>=1536)||(a->log_urgent&&now>=a->log_urgent_at)||(now>=a->log_flush_at);
+  int due=force||(a->logused>=2048)||(a->log_urgent&&now>=a->log_urgent_at)||(now>=a->log_flush_at);
   if(due){n=a->logused;memcpy(tmp,a->logbuf,n);a->logused=0;a->log_urgent=0;a->log_flush_at=now+15000000;a->log_urgent_at=now+2000000;}
  }
  if(!n)return;
@@ -161,20 +163,105 @@ __attribute__((noinline)) static void wlog_conn_slots(struct app*a,u64 now,const
  if(wlog_begin(a,now,"conn_dump")){
   wlog_raw(a,"src=");wlog_raw(a,ctx_tag);wlog_raw(a," count=");wlog_dec(a,count);
   for(int i=0;i<count&&i<BT_CONN_SNAP_LIMIT;i++){
-   wlog_raw(a," [");wlog_mac(a,slots[i].bdaddr);
-   wlog_raw(a," st=");wlog_dec(a,(long)slots[i].state);
-   wlog_raw(a," pol=");wlog_hex(a,slots[i].policy);
-   wlog_raw(a," hdl=");wlog_hex(a,slots[i].handle);
-   wlog_raw(a," svc=");wlog_hex(a,slots[i].dev_services);
-   wlog_raw(a," str=");wlog_dec(a,slots[i].stream_ok);wlog_raw(a,"]");
+   const struct bt_conn_slot*s=&slots[i];
+   wlog_raw(a," [");wlog_mac(a,s->bdaddr);
+   wlog_raw(a," st=");wlog_dec(a,(long)s->state);
+   wlog_raw(a," pol=");wlog_hex(a,s->policy);
+   wlog_raw(a," hdl=");wlog_hex(a,s->handle);
+   wlog_raw(a," cod=");wlog_hex(a,s->dev_cod);
+   wlog_raw(a," svc=");wlog_hex(a,s->dev_services);
+   wlog_raw(a," flg=");wlog_hex(a,s->dev_flags);
+   wlog_raw(a," str=");wlog_dec(a,s->stream_ok);
+   if(s->stream_ok){
+    wlog_raw(a," bp=");wlog_dec(a,s->st_bitpool);wlog_raw(a,"/");wlog_dec(a,s->st_enc_bp);
+    wlog_raw(a," lim=");wlog_dec(a,s->min_bp);wlog_raw(a,"-");wlog_dec(a,s->max_bp);
+    wlog_raw(a," q=");wlog_dec(a,s->st_queued);wlog_raw(a," inf=");wlog_dec(a,s->st_inflight);
+    wlog_raw(a," frm=");wlog_dec(a,s->st_frames);wlog_raw(a," kdr=");wlog_dec(a,(long)s->st_dropped);
+   }
+   wlog_raw(a,"]");
   }
   wlog_end(a,1);
  }
 }
+__attribute__((noinline)) static void wlog_hex_dump(struct app*a,u64 now,const char*tag,u64 addr,const u8*buf,u32 len,int urgent){
+ if(!buf||!len)return;
+ for(u32 off=0;off<len;off+=128){
+  u32 n=len-off;if(n>128)n=128;
+  if(wlog_begin(a,now,tag)){
+   wlog_raw(a,"addr=");wlog_hex(a,addr+off);wlog_raw(a," off=");wlog_dec(a,(long)off);
+   wlog_raw(a," len=");wlog_dec(a,(long)n);wlog_raw(a," bytes=");
+   wlog_bytes(a,buf+off,n);
+   wlog_end(a,urgent);
+  }
+ }
+}
+__attribute__((noinline)) static void wlog_bt_full(struct app*a,u64 now,const char*tag,u64 address,int with_raw){
+ struct bt_full_diag fd;memset(&fd,0,sizeof(fd));
+ int rc=bt_full_diag(address,&fd);
+ if(rc){
+  if(wlog_begin(a,now,"ERR bt_full_diag")){wlog_raw(a,"src=");wlog_raw(a,tag);wlog_raw(a," rc=");wlog_dec(a,rc);wlog_end(a,1);}
+  return;
+ }
+ wlog_conn_slots(a,now,tag,fd.slot_count,fd.slots);
+ if(with_raw&&fd.target_found){
+  if(wlog_begin(a,now,"bt_ptrs")){
+   wlog_raw(a,"src=");wlog_raw(a,tag);wlog_raw(a," conn=");wlog_hex(a,fd.conn_ptr);
+   wlog_raw(a," dev=");wlog_hex(a,fd.dev_ptr);wlog_raw(a," stream=");wlog_hex(a,fd.stream_ptr);
+   wlog_end(a,1);
+  }
+  if(fd.dev_ptr)wlog_hex_dump(a,now,"bt_dev_raw",fd.dev_ptr,fd.dev_raw,sizeof(fd.dev_raw),1);
+  if(fd.conn_ptr){
+   wlog_hex_dump(a,now,"bt_conn_hdr",fd.conn_ptr,fd.conn_hdr,sizeof(fd.conn_hdr),1);
+   wlog_hex_dump(a,now,"bt_conn_tail",fd.conn_ptr,fd.conn_tail,sizeof(fd.conn_tail),1);
+  }
+  if(fd.stream_ptr)wlog_hex_dump(a,now,"bt_stream_raw",fd.stream_ptr,fd.stream_cfg,sizeof(fd.stream_cfg),1);
+ }
+}
+static void wlog_shm_probe(struct app*a,u64 now,const char*reason){
+ static const char*const names[]={"/shm_acap.full","/shm_acap","/shm_acap.main","/shm_acap.voice","/shm_acap.bgm","/shm_acap.pad","/shm_acap.sub","/shm_audio","/shm_aout"};
+ if(wlog_begin(a,now,"shm_probe_start")){
+  wlog_raw(a,"reason=");wlog_raw(a,reason);
+  wlog_raw(a," tv=");wlog_dec(a,a->tv);wlog_raw(a," muted=");wlog_dec(a,a->muted);
+  wlog_raw(a," hdmi=");wlog_dec(a,a->hdmi);wlog_raw(a," hdmi_rc=");wlog_dec(a,a->hdmi_rc);
+  wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_raw(a," vsync=");wlog_dec(a,a->volume_synced);
+  wlog_end(a,1);
+ }
+ if(a->ring){
+  u8 hdr[64];for(unsigned i=0;i<sizeof(hdr);i++)hdr[i]=((const volatile u8*)a->ring)[i];
+  wlog_hex_dump(a,now,"shm_ring_hdr",0,hdr,sizeof(hdr),1);
+ }
+ for(unsigned i=0;i<sizeof(names)/sizeof(names[0]);i++){
+  int fd=a->shm(names[i],0,0);
+  if(fd<0){
+   if(wlog_begin(a,now,"shm_probe")){wlog_raw(a,"name=");wlog_raw(a,names[i]);wlog_raw(a," rc=");wlog_dec(a,fd);wlog_end(a,0);}
+   continue;
+  }
+  void*p=a->map(0,0x1000,1,1,fd,0);
+  if(p&&p!=(void*)-1){
+   u8 b[32];for(unsigned k=0;k<sizeof(b);k++)b[k]=((const volatile u8*)p)[k];
+   u32 hdr=*(const volatile u32*)p;
+   u32 wp=(u32)(*(const volatile u64*)((const u8*)p+8)>>32);
+   u32 rp=*(const volatile u32*)((const u8*)p+12);
+   a->unmap(p,0x1000);
+   if(wlog_begin(a,now,"shm_probe")){
+    wlog_raw(a,"name=");wlog_raw(a,names[i]);wlog_raw(a," fd=");wlog_dec(a,fd);
+    wlog_raw(a," hdr=");wlog_hex(a,hdr);wlog_raw(a," wp=");wlog_dec(a,(long)wp);
+    wlog_raw(a," rp=");wlog_dec(a,(long)rp);wlog_raw(a," bytes=");wlog_bytes(a,b,sizeof(b));
+    wlog_end(a,1);
+   }
+  }else{
+   if(wlog_begin(a,now,"shm_probe")){wlog_raw(a,"name=");wlog_raw(a,names[i]);wlog_raw(a," fd=");wlog_dec(a,fd);wlog_raw(a," map=fail");wlog_end(a,1);}
+  }
+  closefd(fd);
+ }
+}
 __attribute__((noinline)) static void wlog_koff(struct app*a,u64 now,int force){
  const struct bt_koff*k=bt_koff_info();
- if(!k||(!force&&a->koff_logged&&k->valid))return;
+ if(!k)return;
+ if(!force&&a->koff_logged&&k->valid)return;
+ if(force&&a->koff_logged&&now<a->koff_err_at)return;
  a->koff_logged=1;
+ if(force)a->koff_err_at=now+10000000;
  if(wlog_begin(a,now,k->valid?"koff":"ERR koff")){
   wlog_raw(a,"valid=");wlog_dec(a,(long)k->valid);wlog_raw(a," fail=");wlog_dec(a,(long)k->fail_stage);
   wlog_raw(a,".");wlog_dec(a,(long)k->fail_sub);wlog_raw(a,".");wlog_dec(a,(long)k->fail_aux);
@@ -196,9 +283,18 @@ __attribute__((noinline)) static void wlog_koff(struct app*a,u64 now,int force){
   wlog_raw(a," bp_lim=");wlog_hex(a,k->conn_min_bp_off);wlog_raw(a,"/");wlog_hex(a,k->conn_max_bp_off);
   wlog_raw(a," sq=");wlog_hex(a,k->stream_queued_off);wlog_raw(a," si=");wlog_hex(a,k->stream_inflight_off);
   wlog_raw(a," sd=");wlog_hex(a,k->stream_dropped_off);wlog_raw(a," sf=");wlog_hex(a,k->stream_frames_off);
-  wlog_raw(a, " sbp=");wlog_hex(a,k->stream_bitpool_off);wlog_raw(a," sebp=");wlog_hex(a,k->stream_enc_bp_off);
+  wlog_raw(a," sbp=");wlog_hex(a,k->stream_bitpool_off);wlog_raw(a," sebp=");wlog_hex(a,k->stream_enc_bp_off);
   wlog_raw(a," fmt=");wlog_hex(a,k->fmt_str);wlog_raw(a," rfmt=");wlog_hex(a,k->fmt_role_str);
   wlog_end(a,!k->valid);
+ }
+ if(k->dump_len>0){
+  u32 dlen=k->dump_len>sizeof(k->dump_bytes)?(u32)sizeof(k->dump_bytes):k->dump_len;
+  if(wlog_begin(a,now,"koff_dump_meta")){
+   wlog_raw(a,"sub=");wlog_dec(a,(long)k->dump_sub);
+   wlog_raw(a," addr=");wlog_hex(a,k->dump_addr);wlog_raw(a," len=");wlog_dec(a,(long)dlen);
+   wlog_end(a,1);
+  }
+  wlog_hex_dump(a,now,"koff_dump",k->dump_addr,k->dump_bytes,dlen,1);
  }
 }
 static void message(struct app*a,const char*s){memset(a->message,0,sizeof(a->message));u64 n=length(s);if(n>127)n=127;memcpy(a->message,s,n);}
@@ -220,8 +316,19 @@ static void mute(struct app*a,int on){
  long result[4]={a->hdmi,a->hdmi_rc,on,v};put("/data/bt_hdmi_mute_status.bin",result,sizeof(result));
  if(wlog_begin(a,a->clock(),a->hdmi_rc?"WARN mute":"mute")){wlog_raw(a,"on=");wlog_dec(a,on);wlog_raw(a," hdmi_rc=");wlog_dec(a,a->hdmi_rc);wlog_end(a,a->hdmi_rc!=0);}
 }
+static void wlog_phase(struct app*a,u64 now){
+ if(a->phase==a->prev_phase)return;
+ if(wlog_begin(a,now,"phase_chg")){
+  wlog_raw(a,"prev=");wlog_dec(a,a->prev_phase);wlog_raw(a," cur=");wlog_dec(a,a->phase);
+  wlog_raw(a," dt_ms=");wlog_dec(a,a->phase_at?(long)((now-a->phase_at)/1000):0);
+  wlog_raw(a," wanted=");wlog_dec(a,a->wanted);wlog_raw(a," streaming=");wlog_dec(a,a->streaming);
+  wlog_end(a,0);
+ }
+ a->prev_phase=a->phase;a->phase_at=now;
+}
 static void stop_audio(struct app*a){
  int was_streaming=a->streaming;
+ if(was_streaming)wlog_bt_full(a,a->clock(),"audio_stop",a->target.address,1);
  lock_state(a);
  a->audio.active=0;
  while(a->audio.in_flight)wait_for_audio_change(a,500);
@@ -275,12 +382,16 @@ static void relink(struct app*a){
  a->audio.stats.refused_since=0;
  unlock_state(a);
  a->relinks_total++;
- if(wlog_begin(a,a->clock(),"WARN relink")){wlog_raw(a,"attempt=");wlog_dec(a,(long)attempt);wlog_raw(a," total=");wlog_dec(a,(long)a->relinks_total);wlog_end(a,1);}
+ u64 now=a->clock();
+ if(wlog_begin(a,now,"WARN relink")){wlog_raw(a,"attempt=");wlog_dec(a,(long)attempt);wlog_raw(a," total=");wlog_dec(a,(long)a->relinks_total);wlog_end(a,1);}
+ wlog_bt_full(a,now,"relink",a->target.address,1);
  stop_audio(a);drop_link(a);a->phase=0;a->next_try=a->clock()+3000000;
  say(a,"The PS4 stopped accepting audio for ",". Reconnecting...");
 }
 static void link_lost(struct app*a){
- if(wlog_begin(a,a->clock(),"ERR link_lost")){wlog_raw(a,"errors=");wlog_dec(a,(long)a->errors);wlog_raw(a," last_rc=");wlog_dec(a,a->last_rc);wlog_end(a,1);}
+ u64 now=a->clock();
+ if(wlog_begin(a,now,"ERR link_lost")){wlog_raw(a,"errors=");wlog_dec(a,(long)a->errors);wlog_raw(a," last_rc=");wlog_dec(a,a->last_rc);wlog_end(a,1);}
+ wlog_bt_full(a,now,"link_lost",a->target.address,1);
  stop_audio(a);a->dropped=1;a->failed=0;a->next_try=a->clock()+2000000;
  say(a,""," disconnected. TV sound is back. Reconnecting...");
  if(may_announce(a,1)){notify("Bluetooth headphones disconnected. TV sound is back on. Reconnecting...");a->announced=1;}
@@ -364,9 +475,10 @@ static int save_target(struct app*a,const struct bt_device*d){
 }
 static void load_target(struct app*a){
  a->target.address=0;a->target.services=0;
- long fd=sc3(5,(long)"/data/bta_audio/device.bin",0,0);if(fd<0)return;
+ long fd=sc3(5,(long)"/data/bta_audio/device.bin",0,0);if(fd<0){a->load_target_rc=(int)fd;return;}
  struct saved_device s;long n=sc3(3,fd,(long)&s,sizeof(s));closefd(fd);
- if(n==sizeof(s)&&s.magic==0x3254454752415442UL&&s.device.address&&!(s.device.address>>48)){s.device.name[95]=0;a->target=s.device;}
+ if(n==sizeof(s)&&s.magic==0x3254454752415442UL&&s.device.address&&!(s.device.address>>48)){s.device.name[95]=0;a->target=s.device;a->load_target_rc=0;}
+ else a->load_target_rc=-22;
 }
 static int save_volume(struct app*a,int volume){
  if(volume<0||volume>100)return -1;unsigned value=(unsigned)volume;
@@ -377,8 +489,9 @@ static int save_volume(struct app*a,int volume){
 }
 static void load_volume(struct app*a){
  a->volume=40;unsigned value=101;long fd=sc3(5,(long)"/data/bta_audio/volume.bin",0,0);
- if(fd<0)return;long n=sc3(3,fd,(long)&value,sizeof(value));closefd(fd);
- if(n==sizeof(value)&&value<=100)a->volume=(int)value;
+ if(fd<0){a->load_vol_rc=(int)fd;return;}long n=sc3(3,fd,(long)&value,sizeof(value));closefd(fd);
+ if(n==sizeof(value)&&value<=100){a->volume=(int)value;a->load_vol_rc=0;}
+ else a->load_vol_rc=-22;
 }
 static int avrcp_to_pct(int raw){if(raw<=0)return 0;if(raw>=127)return 100;return (raw*100+63)/127;}
 static int pct_to_avrcp(int pct){if(pct<=0)return 0;if(pct>=100)return 127;return (pct*127+50)/100;}
@@ -413,7 +526,7 @@ static void avrcp_query_volume(struct app*a){
 static void wlog_patch(struct app*a,u64 now){
  if(a->patch_logged&&!a->patch_rc)return;
  a->patch_logged=1;
- struct{long status;u64 before,after,base,rx_start,rx_len,copyout_fn,site_addr;u32 fail_step,pad;u8 surround[24];}pr;
+ struct{long status;u64 before,after,base,rx_start,rx_len,copyout_fn,site_addr;u32 fail_step,pad;u8 surround[64];}pr;
  memset(&pr,0,sizeof(pr));
  long fd=sc3(5,(long)"/data/bt_accept_patch_result.bin",0,0);
  if(fd>=0){sc3(3,fd,(long)&pr,sizeof(pr));closefd(fd);}
@@ -422,8 +535,9 @@ static void wlog_patch(struct app*a,u64 now){
   wlog_raw(a," before=");wlog_hex(a,pr.before);wlog_raw(a," after=");wlog_hex(a,pr.after);
   if(a->patch_rc||pr.status){
    wlog_raw(a," step=");wlog_dec(a,(long)pr.fail_step);
-   wlog_raw(a," base=");wlog_hex(a,pr.base);wlog_raw(a," site=");wlog_hex(a,pr.site_addr);
-   if(pr.site_addr){wlog_raw(a," bytes=");wlog_bytes(a,pr.surround,sizeof(pr.surround));}
+   wlog_raw(a," base=");wlog_hex(a,pr.base);wlog_raw(a," rx=");wlog_hex(a,pr.rx_start);wlog_raw(a,"+");wlog_hex(a,pr.rx_len);
+   wlog_raw(a," copyout=");wlog_hex(a,pr.copyout_fn);wlog_raw(a," site=");wlog_hex(a,pr.site_addr);
+   wlog_raw(a," bytes=");wlog_bytes(a,pr.surround,sizeof(pr.surround));
   }
   wlog_end(a,a->patch_rc!=0);
  }
@@ -447,28 +561,35 @@ static void begin_connect(struct app*a){
  end_scan(a);u64 address=a->target.address;a->btstate=sc3(54,a->bt,0x80086203,(long)&address);
  a->prev_btstate=a->btstate;a->btstate_at=now;
  a->phase=1;a->deadline=a->clock()+30000000;say(a,"Connecting to ","...");
- if(a->btstate<5||a->btstate>6){sc3(54,a->bt,0x20046205,0);a->connect_rc=sc3(54,a->bt,0x8008620a,(long)&address);
+ if(a->btstate<5||a->btstate>6){
+  long stop_rc=sc3(54,a->bt,0x20046205,0);
+  if(stop_rc<0&&wlog_begin(a,now,"WARN scan_stop_conn")){wlog_raw(a,"rc=");wlog_dec(a,stop_rc);wlog_end(a,1);}
+  a->connect_rc=sc3(54,a->bt,0x8008620a,(long)&address);
   if(wlog_begin(a,now,a->connect_rc<0?"ERR connect":"connect")){
    wlog_raw(a,"attempt=");wlog_dec(a,(long)a->attempts);wlog_raw(a," mac=");wlog_mac(a,address);
    wlog_raw(a," btstate=");wlog_dec(a,a->btstate);wlog_raw(a," connect_rc=");wlog_dec(a,a->connect_rc);wlog_end(a,a->connect_rc<0);
   }
+  wlog_phase(a,now);
   /* An immediate driver error (e.g. 0x802F0204) means this device will not
    * connect right now; fail fast instead of waiting out the 30 s window. */
-  if(a->connect_rc<0){retry_named(a,"Couldn't connect to ",". Make sure it's on, nearby and not connected to another device.",8000000);return;}
+  if(a->connect_rc<0){wlog_bt_full(a,now,"connect_err",address,1);retry_named(a,"Couldn't connect to ",". Make sure it's on, nearby and not connected to another device.",8000000);return;}
  }else{
   a->connect_rc=0;
   if(wlog_begin(a,now,"connect")){wlog_raw(a,"already_linked mac=");wlog_mac(a,address);wlog_raw(a," btstate=");wlog_dec(a,a->btstate);wlog_end(a,0);}
+  wlog_phase(a,now);
  }
 }
 static void start_audio(struct app*a){
+ u64 now=a->clock();
  a->shmfd=a->shm("/shm_acap.full",0,0);
  if(a->shmfd<0){
-  if(wlog_begin(a,a->clock(),"WARN shm_open")){wlog_raw(a,"rc=");wlog_dec(a,a->shmfd);wlog_end(a,1);}
+  if(wlog_begin(a,now,"WARN shm_open")){wlog_raw(a,"rc=");wlog_dec(a,a->shmfd);wlog_end(a,1);}
+  if(now>=a->shm_probe_at){a->shm_probe_at=now+30000000;wlog_shm_probe(a,now,"shm_open_fail");}
   retry(a,"Waiting for the PS4 audio service.");return;
  }
  void*p=a->map(0,0x10000,1,1,a->shmfd,0);
  if(!p||p==(void*)-1){
-  if(wlog_begin(a,a->clock(),"ERR shm_mmap")){wlog_raw(a,"rc=");wlog_dec(a,(long)p);wlog_end(a,1);}
+  if(wlog_begin(a,now,"ERR shm_mmap")){wlog_raw(a,"rc=");wlog_dec(a,(long)p);wlog_end(a,1);}
   retry(a,"Unable to open the game audio stream.");return;
  }
  a->ring=p;
@@ -476,11 +597,13 @@ static void start_audio(struct app*a){
  u32 writepos=(u32)(*(const volatile u64*)(a->ring+8)>>32);
  u32 readpos=*(volatile u32*)(a->ring+12);
  if(hdr!=0x10000||readpos<16||readpos>=0x10000||(readpos&7)){
-  if(wlog_begin(a,a->clock(),"ERR shm_format")){wlog_raw(a,"hdr=");wlog_hex(a,hdr);wlog_raw(a," wp=");wlog_hex(a,writepos);wlog_raw(a," rp=");wlog_hex(a,readpos);wlog_end(a,1);}
+  if(wlog_begin(a,now,"ERR shm_format")){wlog_raw(a,"hdr=");wlog_hex(a,hdr);wlog_raw(a," wp=");wlog_hex(a,writepos);wlog_raw(a," rp=");wlog_hex(a,readpos);wlog_end(a,1);}
+  wlog_shm_probe(a,now,"shm_format");
   retry(a,"The PS4 audio stream has an unexpected format.");return;
  }
  unsigned init_avail=writepos>=readpos?writepos-readpos:0xfff0-readpos+writepos;
  a->streaming=1;a->phase=3;a->refused_since=0;a->errors=0;a->stream_at=a->clock();a->test_until=0;
+ a->shm_silence_sec=0;a->full_diag_on_bad=0;
  if(!a->sec_start)a->sec_start=a->stream_at;
  a->meter_at=a->stream_at;
  a->health_at=a->stream_at+10000000;a->health_resyncs=a->resyncs;a->health_ok_skips=0;memset(&a->health,0,sizeof(a->health));
@@ -490,6 +613,7 @@ static void start_audio(struct app*a){
  a->shm_stall_at=a->stream_at+3000000;a->shm_stall_wp=writepos;a->shm_stall_warned=0;
  int was_dropped=a->dropped,told=a->announced,fresh=!a->session;
  a->attempts=0;a->failed=0;a->dropped=0;a->announced=0;a->session=1;a->ok_at=a->stream_at;a->meter=0;a->meter_peak=0;
+ wlog_phase(a,a->stream_at);
  if(wlog_begin(a,a->stream_at,"audio_start")){
   unsigned peers=0,hid=0;
   for(unsigned i=0;i<a->devices.count;i++){
@@ -498,12 +622,15 @@ static void start_audio(struct app*a){
    peers++;
    if((d->services&0x40)||(((d->cod>>8)&31)==5))hid++;
   }
+  u8 shdr[32];for(unsigned k=0;k<sizeof(shdr);k++)shdr[k]=((const volatile u8*)a->ring)[k];
   wlog_raw(a,"mac=");wlog_mac(a,a->target.address);wlog_raw(a," name=");wlog_str(a,target_name(a));
   wlog_raw(a," joint=");wlog_dec(a,a->joint);wlog_raw(a," tv=");wlog_dec(a,a->tv);
   wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_raw(a," hdr=");wlog_hex(a,hdr);
   wlog_raw(a," wp=");wlog_dec(a,(long)writepos);wlog_raw(a," rp=");wlog_dec(a,(long)readpos);
   wlog_raw(a," avail=");wlog_dec(a,(long)init_avail);
-  wlog_raw(a," peers=");wlog_dec(a,(long)peers);wlog_raw(a," hid=");wlog_dec(a,(long)hid);wlog_end(a,1);
+  wlog_raw(a," peers=");wlog_dec(a,(long)peers);wlog_raw(a," hid=");wlog_dec(a,(long)hid);
+  wlog_raw(a," shdr=");wlog_bytes(a,shdr,sizeof(shdr));
+  wlog_end(a,1);
  }
  say(a,"Connected to ",a->tv?". TV sound is on.":". TV sound is muted.");
  avrcp_query_volume(a);
@@ -516,6 +643,7 @@ static void start_audio(struct app*a){
  s->refused_ms=0;s->error_count=0;s->has_pending=0;s->was_testing=0;s->pending_peak=0;s->active=1;
  wake_audio(a);
  unlock_state(a);
+ wlog_bt_full(a,a->stream_at,"audio_start",a->target.address,1);
  if(was_dropped){if(told&&may_announce(a,2))notify("Bluetooth headphones reconnected.");}
  else if(fresh&&may_announce(a,0)){char m[200];compose(m,sizeof(m),"Bluetooth headphones connected: ",target_name(a),a->tv?". TV sound stays on.":". TV sound muted.");notify(m);}
 }
@@ -550,7 +678,7 @@ static void bluetooth_tick(struct app*a,u64 now){
      long prc=sc3(54,a->bt,0x80106208,(long)q);
      if(wlog_begin(a,now,prc<0?"WARN bt_pair_ack":"bt_pair_ack")){wlog_raw(a,"mac=");wlog_mac(a,a->target.address);wlog_raw(a," rc=");wlog_dec(a,prc);wlog_end(a,prc<0);}
     }
-    if(ev[i].type==3){a->pin_pending=1;a->deadline=now+60000000;message(a,"These headphones require a pairing PIN.");}
+    if(ev[i].type==3){a->pin_pending=1;a->deadline=now+60000000;message(a,"These headphones require a pairing PIN.");if(wlog_begin(a,now,"bt_pin_req")){wlog_raw(a,"mac=");wlog_mac(a,a->target.address);wlog_end(a,1);}}
     if(ev[i].type==11&&ev[i].subtype<=2){
      int raw=(int)(ev[i].data&0x7f),pct=avrcp_to_pct(raw),was_synced=a->volume_synced;
      a->volume_synced=1;a->avrcp_pending=0;a->avrcp_retries=0;
@@ -567,13 +695,17 @@ static void bluetooth_tick(struct app*a,u64 now){
  }
  if(a->avrcp_pending&&a->bt>=0&&now>=a->avrcp_retry_at){
   if(a->avrcp_retries<8){a->avrcp_retries++;avrcp_set_volume(a,a->volume);}
-  else{a->avrcp_pending=0;a->avrcp_retries=0;}
+  else{
+   a->avrcp_pending=0;a->avrcp_retries=0;
+   if(wlog_begin(a,now,"WARN avrcp_timeout")){wlog_raw(a,"vol=");wlog_dec(a,a->volume);wlog_end(a,1);}
+  }
  }
- if(!a->wanted)return;
- if(a->phase==0){if(now>=a->next_try){a->attempts++;a->failed=0;begin_connect(a);}return;}
+ if(!a->wanted){wlog_phase(a,now);return;}
+ if(a->phase==0){if(now>=a->next_try){a->attempts++;a->failed=0;begin_connect(a);}wlog_phase(a,now);return;}
  if(a->phase==4){
-  if(device(a,a->target.address)){end_scan(a);a->phase=0;begin_connect(a);return;}
-  if(now>=a->deadline)retry_named(a,"Couldn't find ",". Put it in pairing mode.",8000000);return;
+  if(device(a,a->target.address)){end_scan(a);a->phase=0;begin_connect(a);wlog_phase(a,now);return;}
+  if(now>=a->deadline)retry_named(a,"Couldn't find ",". Put it in pairing mode.",8000000);
+  wlog_phase(a,now);return;
  }
  if(a->phase==1){
   u64 address=a->target.address;a->btstate=sc3(54,a->bt,0x80086203,(long)&address);
@@ -599,20 +731,27 @@ static void bluetooth_tick(struct app*a,u64 now){
      wlog_raw(a," svc=");wlog_hex(a,pd.dev_services);wlog_raw(a," lps_rc=");wlog_dec(a,pd.lps_rc);
      wlog_raw(a," role_rc=");wlog_dec(a,pd.role_rc);wlog_end(a,a->packet_rc!=0||pd.skipped);
     }
-    if(a->packet_rc&&pd.slot_count>0)wlog_conn_slots(a,now,"prep",pd.slot_count,pd.slots);
-    if(a->packet_rc){retry(a,"No supported Bluetooth audio link. Retrying shortly.");return;}
+    if(pd.slot_count>0)wlog_conn_slots(a,now,"prep",pd.slot_count,pd.slots);
+    if(a->packet_rc){wlog_bt_full(a,now,"prep_err",address,1);retry(a,"No supported Bluetooth audio link. Retrying shortly.");wlog_phase(a,now);return;}
    }
    a->phase=2;a->deadline=now+400000;}
   else if(now>=a->deadline){
    if(wlog_begin(a,now,"WARN connect_timeout")){wlog_raw(a,"btstate=");wlog_dec(a,a->btstate);wlog_raw(a," dt_ms=");wlog_dec(a,(long)((now-a->btstate_at)/1000));wlog_end(a,1);}
+   wlog_bt_full(a,now,"connect_timeout",address,1);
    retry_named(a,""," didn't respond. Is it on and nearby?",8000000);
   }
  }else if(a->phase==2&&now>=a->deadline)start_audio(a);
+ wlog_phase(a,now);
 }
 __attribute__((noinline)) static void wlog_stream_summary(struct app*a,u64 now,const char*tag,const struct second*s,u32 resync_d,int urgent){
  if(wlog_begin(a,now,tag)){
-  wlog_raw(a,"pkts=");wlog_dec(a,(long)s->pkts);wlog_raw(a," silent=");wlog_dec(a,(long)s->silent);
-  wlog_raw(a," peak=");wlog_dec(a,(long)s->peak);wlog_raw(a," wp_moves=");wlog_dec(a,(long)s->wp_moves);
+  wlog_raw(a,"pkts=");wlog_dec(a,(long)s->pkts);wlog_raw(a," nz=");wlog_dec(a,(long)s->nonzero_pkts);
+  wlog_raw(a," silent=");wlog_dec(a,(long)s->silent);wlog_raw(a," peak=");wlog_dec(a,(long)s->peak);
+  wlog_raw(a," wp_moves=");wlog_dec(a,(long)s->wp_moves);
+  wlog_raw(a," av=");wlog_dec(a,(long)s->min_avail);wlog_raw(a,"..");wlog_dec(a,(long)s->max_avail);
+  if(s->zero_avail){wlog_raw(a," z_av=");wlog_dec(a,(long)s->zero_avail);}
+  if(s->nan_samples){wlog_raw(a," nan=");wlog_dec(a,(long)s->nan_samples);}
+  if(s->clipped){wlog_raw(a," clip=");wlog_dec(a,(long)s->clipped);}
   wlog_raw(a," refused=");wlog_dec(a,(long)s->refused);
   wlog_raw(a," failed=");wlog_dec(a,(long)s->failed);wlog_raw(a," resyncs=+");wlog_dec(a,(long)resync_d);
   wlog_raw(a,"(");wlog_dec(a,(long)a->resyncs);wlog_raw(a,") late8=");wlog_dec(a,(long)s->late8);
@@ -625,6 +764,8 @@ __attribute__((noinline)) static void wlog_stream_summary(struct app*a,u64 now,c
   if(s->maxref_ms){wlog_raw(a," maxref_ms=");wlog_dec(a,(long)s->maxref_ms);}
   if(a->bp_cur){wlog_raw(a," bp=");wlog_dec(a,a->bp_cur);}
   wlog_raw(a," kdrops=");wlog_dec(a,(long)a->bp_health_drops);
+  wlog_raw(a," vol=");wlog_dec(a,a->volume);wlog_raw(a," vsync=");wlog_dec(a,a->volume_synced);
+  wlog_raw(a," jnt=");wlog_dec(a,a->joint);wlog_raw(a," tv=");wlog_dec(a,a->tv);wlog_raw(a," mut=");wlog_dec(a,a->muted);
   if(urgent&&a->bp_health_drops>=25)wlog_raw(a," [BT_KERNEL_DROP]");
   if(s->refused)wlog_raw(a," [BT_QUEUE_REFUSED]");
   if(resync_d)wlog_raw(a," [RING_OVERFLOW_DROP]");
@@ -639,7 +780,11 @@ static void roll_second(struct app*a,u64 now){
  if(a->sec_start&&now-a->sec_start<1000000)return;
  if(a->sec_start){
   a->cur.seq=++a->sec_seq;a->secs[a->sec_seq%128]=a->cur;
-  a->health.pkts+=a->cur.pkts;a->health.silent+=a->cur.silent;a->health.wp_moves+=a->cur.wp_moves;
+  a->health.pkts+=a->cur.pkts;a->health.nonzero_pkts+=a->cur.nonzero_pkts;
+  a->health.silent+=a->cur.silent;a->health.wp_moves+=a->cur.wp_moves;
+  a->health.nan_samples+=a->cur.nan_samples;a->health.clipped+=a->cur.clipped;a->health.zero_avail+=a->cur.zero_avail;
+  if(a->cur.min_avail&&(!a->health.min_avail||a->cur.min_avail<a->health.min_avail))a->health.min_avail=a->cur.min_avail;
+  if(a->cur.max_avail>a->health.max_avail)a->health.max_avail=a->cur.max_avail;
   a->health.refused+=a->cur.refused;a->health.failed+=a->cur.failed;
   a->health.late8+=a->cur.late8;a->health.late16+=a->cur.late16;a->health.late50+=a->cur.late50;
   a->health.rc_full+=a->cur.rc_full;a->health.rc_one+=a->cur.rc_one;a->health.rc_other+=a->cur.rc_other;
@@ -649,6 +794,12 @@ static void roll_second(struct app*a,u64 now){
   if(a->cur.maxsched_us>a->health.maxsched_us)a->health.maxsched_us=a->cur.maxsched_us;
   if(a->cur.maxback_ms>a->health.maxback_ms)a->health.maxback_ms=a->cur.maxback_ms;
   if(a->cur.peak>a->health.peak)a->health.peak=a->cur.peak;
+  if(a->cur.pkts>0&&a->cur.peak==0){
+   a->shm_silence_sec++;
+   if(a->shm_silence_sec==2&&now>=a->shm_probe_at){a->shm_probe_at=now+30000000;wlog_shm_probe(a,now,"shm_silence_2s");}
+  }else{
+   a->shm_silence_sec=0;
+  }
   if((a->cur.refused||a->cur.failed||a->cur.late50)&&now>=a->health_warn_at){
    a->health_warn_at=now+5000000;
    wlog_stream_summary(a,now,"WARN stream_1s",&a->cur,0,1);
@@ -660,6 +811,7 @@ static void roll_second(struct app*a,u64 now){
   a->bp_ten_drops=0;
   if(bad){
    wlog_stream_summary(a,now,"WARN stream_10s",&a->health,rd,1);
+   if((!a->full_diag_on_bad||now>=a->full_diag_at)){a->full_diag_on_bad=1;a->full_diag_at=now+30000000;wlog_bt_full(a,now,"stream_bad",a->target.address,1);}
    a->health_ok_skips=0;
   }else if(++a->health_ok_skips>=3){
    wlog_stream_summary(a,now,"OK stream_30s",&a->health,0,0);
@@ -730,6 +882,7 @@ static unsigned audio_tick(struct app*a,u64 now){
    rem=available;
   }else{
    if(available<1536){
+    s->cur.zero_avail++;
     /* Use the 48 kHz stereo float rate to estimate the next block. Cap the
      * wait because the capture producer can publish several frames at once. */
     unsigned wait=(1536-available)*1000/384;
@@ -737,13 +890,17 @@ static unsigned audio_tick(struct app*a,u64 now){
    }
    backlog=available;
    rem=available-1536;
+   if(!s->cur.min_avail||available<s->cur.min_avail)s->cur.min_avail=available;
+   if(available>s->cur.max_avail)s->cur.max_avail=available;
    u32 cursor=s->readpos;
    int eff_vol=s->volume_synced?(s->volume>0?100:0):s->volume;
    float gain=32767.0f*(float)eff_vol/100.0f;
    for(unsigned i=0;i<384;i++){
     float f=*(const volatile float*)(s->ring+cursor);
     cursor+=4;if(cursor==0x10000)cursor=16;
-    if(f!=f)f=0;if(f>1)f=1;if(f<-1)f=-1;
+    if(f!=f){f=0;s->cur.nan_samples++;}
+    if(f>1){f=1;s->cur.clipped++;}
+    if(f<-1){f=-1;s->cur.clipped++;}
     int v=(int)(f*gain);pcm[i]=(short)v;
     unsigned m=v<0?-v:v;if(m>peak)peak=m;
    }
@@ -763,7 +920,7 @@ static unsigned audio_tick(struct app*a,u64 now){
  lock_state(a);
  struct second*cur=&s->cur;
  st->last_rc=rc;cur->pkts++;
- if(peak==0)cur->silent++;
+ if(peak==0)cur->silent++;else cur->nonzero_pkts++;
  if(rc==0)cur->refused++;else if(rc<0)cur->failed++;
  if(s->last_send){
   u64 gap=send_at-s->last_send;
@@ -930,6 +1087,7 @@ static void collect_audio(struct app*a,u64 now,int beat){
     wlog_raw(a," wp=");wlog_dec(a,(long)cur_wp);wlog_raw(a," rp=");wlog_dec(a,(long)readpos);
     wlog_raw(a," tv=");wlog_dec(a,a->tv);wlog_raw(a," muted=");wlog_dec(a,a->muted);wlog_end(a,1);
    }
+   if(now>=a->shm_probe_at){a->shm_probe_at=now+30000000;wlog_shm_probe(a,now,"shm_stalled");}
   }else{
    a->shm_stall_warned=1;
   }
@@ -1026,7 +1184,7 @@ static int host_valid(char*request){
  u8 ip[4];for(int i=0;i<4;i++){unsigned n=0,digits=0;while(*p>='0'&&*p<='9'){n=n*10+*p++-'0';if(++digits>3||n>255)return 0;}if(!digits)return 0;ip[i]=n;if(i<3&&*p++!='.')return 0;}
  return local_ip(ip)&&starts(p,":8097\r\n");
 }
-static void wlog_http_rej(struct app*a,const char*kind,const char*req){
+static void wlog_http_rej(struct app*a,const char*kind,char*req){
  u64 now=a->clock();
  if(now<a->http_rej_at){a->http_rej_suppressed++;return;}
  u32 sup=a->http_rej_suppressed;a->http_rej_suppressed=0;a->http_rej_at=now+2000000;
@@ -1034,21 +1192,37 @@ static void wlog_http_rej(struct app*a,const char*kind,const char*req){
   wlog_raw(a,"kind=");wlog_raw(a,kind);wlog_raw(a," req=");
   char line[64];unsigned i=0;while(req[i]&&req[i]!='\r'&&req[i]!='\n'&&i+1<sizeof(line)){line[i]=req[i];i++;}line[i]=0;
   wlog_str(a,line);
+  char*h=header(req,"host");
+  if(h){
+   char hb[48];unsigned j=0;while(h[j]&&h[j]!='\r'&&h[j]!='\n'&&j+1<sizeof(hb)){hb[j]=h[j];j++;}hb[j]=0;
+   wlog_raw(a," host=");wlog_str(a,hb);
+  }
   if(sup){wlog_raw(a," sup=");wlog_dec(a,(long)sup);}
+  wlog_end(a,0);
+ }
+}
+static void wlog_http_first(struct app*a,u32 bit,const char*tag,char*req){
+ if(a->http_seen_mask&bit)return;
+ a->http_seen_mask|=bit;
+ if(wlog_begin(a,a->clock(),"http_first")){
+  wlog_raw(a,"ep=");wlog_raw(a,tag);
+  char*h=header(req,"host");
+  if(h){char hb[48];unsigned j=0;while(h[j]&&h[j]!='\r'&&h[j]!='\n'&&j+1<sizeof(hb)){hb[j]=h[j];j++;}hb[j]=0;wlog_raw(a," host=");wlog_str(a,hb);}
   wlog_end(a,0);
  }
 }
 static void dispatch(struct app*a,struct client*c){
  char body[12000];
  if(!host_valid(c->input)){wlog_http_rej(a,"host",c->input);response(c,"403 Forbidden","text/plain","Use the PS4 IP address.",23);return;}
- if(starts(c->input,"GET / HTTP/1.")){response(c,"200 OK","text/html; charset=utf-8",web_page,sizeof(web_page)-1);return;}
+ if(starts(c->input,"GET / HTTP/1.")){wlog_http_first(a,1,"/",c->input);response(c,"200 OK","text/html; charset=utf-8",web_page,sizeof(web_page)-1);return;}
  if(starts(c->input,"GET /api/version HTTP/1.")){
+  wlog_http_first(a,2,"/api/version",c->input);
   static const char version[]="{\"version\":\"" BTA_VERSION "\"}";
   response(c,"200 OK","application/json",version,sizeof(version)-1);return;
  }
- if(starts(c->input,"GET /api/native HTTP/1.")){unsigned n=native_status(a,body);response(c,"200 OK","application/octet-stream",body,n);return;}
- if(starts(c->input,"GET /api/status HTTP/1.")){unsigned n=status(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
- if(starts(c->input,"GET /api/timing HTTP/1.")){unsigned n=timing_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
+ if(starts(c->input,"GET /api/native HTTP/1.")){wlog_http_first(a,4,"/api/native",c->input);unsigned n=native_status(a,body);response(c,"200 OK","application/octet-stream",body,n);return;}
+ if(starts(c->input,"GET /api/status HTTP/1.")){wlog_http_first(a,8,"/api/status",c->input);unsigned n=status(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
+ if(starts(c->input,"GET /api/timing HTTP/1.")){wlog_http_first(a,16,"/api/timing",c->input);unsigned n=timing_json(a,body,sizeof(body));response(c,"200 OK","application/json",body,n);return;}
  char*control=header(c->input,"x-bta-control");
  if(!starts(c->input,"POST ")||!control||!starts(control,"1\r\n")){wlog_http_rej(a,"ctrl",c->input);response(c,"403 Forbidden","text/plain","Control header required.",24);return;}
  if(starts(c->input,"POST /api/app-log HTTP/1.")){
@@ -1106,20 +1280,20 @@ static void dispatch(struct app*a,struct client*c){
  else if(starts(c->input,"POST /api/connect HTTP/1.")){a->wanted=1;reset_audio_retries(a,0);sc3(10,(long)TV_ON,0,0);a->tv=0;if(!a->streaming){end_scan(a);a->phase=0;a->next_try=0;a->poll_at=0;a->dropped=a->failed=a->announced=a->session=0;a->attempts=0;say(a,"Connecting to ","...");}if(wlog_begin(a,a->clock(),"cmd_connect")){wlog_raw(a,"streaming=");wlog_dec(a,a->streaming);wlog_end(a,1);}}
  else if(starts(c->input,"POST /api/stop HTTP/1.")){if(wlog_begin(a,a->clock(),"cmd_stop")){wlog_raw(a,"ok");wlog_end(a,1);}a->wanted=0;end_scan(a);stop_audio(a);drop_link(a);reset_audio_retries(a,1);closefd(a->bt);a->bt=-1;a->dropped=a->failed=a->announced=a->session=0;a->attempts=0;message(a,"Earbud audio stopped. TV sound restored.");}
  else if(starts(c->input,"POST /api/joint-on HTTP/1.")){
-  if(!a->target.address){response(c,"409 Conflict","text/plain","Select headphones first.",24);return;}
+  if(!a->target.address){wlog_http_rej(a,"joint_nosel",c->input);response(c,"409 Conflict","text/plain","Select headphones first.",24);return;}
   char p[40];joint_path(a->target.address,p);sc3(10,(long)p,0,0);
   a->joint=1;message(a,"Joint stereo is on for these headphones.");
   if(wlog_begin(a,a->clock(),"cmd_joint")){wlog_raw(a,"joint=1");wlog_end(a,1);}
  }
  else if(starts(c->input,"POST /api/joint-off HTTP/1.")){
-  if(!a->target.address){response(c,"409 Conflict","text/plain","Select headphones first.",24);return;}
+  if(!a->target.address){wlog_http_rej(a,"joint_nosel",c->input);response(c,"409 Conflict","text/plain","Select headphones first.",24);return;}
   char p[40];joint_path(a->target.address,p);
-  if(put(p,"on\n",3)){response(c,"500 Internal Server Error","text/plain","Cannot save preference.",23);return;}
+  if(put(p,"on\n",3)){wlog_http_rej(a,"joint_save",c->input);response(c,"500 Internal Server Error","text/plain","Cannot save preference.",23);return;}
   a->joint=0;message(a,"Joint stereo is off for these headphones.");
   if(wlog_begin(a,a->clock(),"cmd_joint")){wlog_raw(a,"joint=0");wlog_end(a,1);}
  }
- else if(starts(c->input,"POST /api/tv-on HTTP/1.")){if(put(TV_ON,"on\n",3)){response(c,"500 Internal Server Error","text/plain","Cannot save preference.",23);return;}a->tv=1;mute(a,0);if(wlog_begin(a,a->clock(),"cmd_tv")){wlog_raw(a,"tv=1");wlog_end(a,0);}}
- else if(starts(c->input,"POST /api/tv-off HTTP/1.")){if(exists(TV_ON)&&sc3(10,(long)TV_ON,0,0)<0){response(c,"500 Internal Server Error","text/plain","Cannot save preference.",23);return;}a->tv=0;if(a->streaming)mute(a,1);if(wlog_begin(a,a->clock(),"cmd_tv")){wlog_raw(a,"tv=0");wlog_end(a,0);}}
+ else if(starts(c->input,"POST /api/tv-on HTTP/1.")){if(put(TV_ON,"on\n",3)){wlog_http_rej(a,"tv_save",c->input);response(c,"500 Internal Server Error","text/plain","Cannot save preference.",23);return;}a->tv=1;mute(a,0);if(wlog_begin(a,a->clock(),"cmd_tv")){wlog_raw(a,"tv=1");wlog_end(a,0);}}
+ else if(starts(c->input,"POST /api/tv-off HTTP/1.")){if(exists(TV_ON)&&sc3(10,(long)TV_ON,0,0)<0){wlog_http_rej(a,"tv_del",c->input);response(c,"500 Internal Server Error","text/plain","Cannot save preference.",23);return;}a->tv=0;if(a->streaming)mute(a,1);if(wlog_begin(a,a->clock(),"cmd_tv")){wlog_raw(a,"tv=0");wlog_end(a,0);}}
  else if(starts(c->input,"POST /api/quit HTTP/1.")){if(wlog_begin(a,a->clock(),"cmd_quit")){wlog_raw(a,"ok");wlog_end(a,1);}a->wanted=0;stop_audio(a);a->quit=1;a->dropped=a->failed=a->announced=a->session=0;a->attempts=0;message(a,"Bluetooth Audio stopped. TV sound restored.");}
  else{wlog_http_rej(a,"404",c->input);response(c,"404 Not Found","text/plain","Not found",9);return;}
  sync_audio_controls(a);
@@ -1129,7 +1303,23 @@ static void network_tick(struct app*a,u64 now){
  for(int i=0;i<4;i++){
   struct client*c=&a->clients[i];
   if(c->fd<0){struct sockaddr4 peer;u32 len=sizeof(peer);long fd=sc3(30,a->listener,(long)&peer,(long)&len);if(fd<0)continue;
-   if(len!=16||!local_ip((u8*)&peer.addr)||nonblock(fd)<0){closefd(fd);continue;}int one=1;sc5(105,fd,0xffff,0x800,(long)&one,4);c->fd=fd;c->used=c->sent=c->total=0;c->input[0]=0;c->deadline=now+3000000;
+   long nb_rc=0;
+   if(len!=16||!local_ip((u8*)&peer.addr)||(nb_rc=nonblock(fd))<0){
+    closefd(fd);
+    if(now>=a->net_drop_at){
+     u32 sup=a->net_drop_suppressed;a->net_drop_suppressed=0;a->net_drop_at=now+5000000;
+     if(wlog_begin(a,now,"WARN net_accept")){
+      const u8*ip=(const u8*)&peer.addr;
+      wlog_raw(a,"len=");wlog_dec(a,(long)len);
+      wlog_raw(a," ip=");wlog_dec(a,ip[0]);wlog_raw(a,".");wlog_dec(a,ip[1]);wlog_raw(a,".");wlog_dec(a,ip[2]);wlog_raw(a,".");wlog_dec(a,ip[3]);
+      wlog_raw(a," nb_rc=");wlog_dec(a,nb_rc);
+      if(sup){wlog_raw(a," sup=");wlog_dec(a,(long)sup);}
+      wlog_end(a,0);
+     }
+    }else a->net_drop_suppressed++;
+    continue;
+   }
+   int one=1;sc5(105,fd,0xffff,0x800,(long)&one,4);c->fd=fd;c->used=c->sent=c->total=0;c->input[0]=0;c->deadline=now+3000000;
   }
    if(now>=c->deadline){closefd(c->fd);c->fd=-1;continue;}
   if(!c->total){long n=sc3(3,c->fd,(long)(c->input+c->used),sizeof(c->input)-c->used-1);
@@ -1142,10 +1332,10 @@ static void network_tick(struct app*a,u64 now){
      unsigned cl=0;
      char*cl_hdr=header(c->input,"content-length");
      if(cl_hdr){while(*cl_hdr>='0'&&*cl_hdr<='9'){if(cl>65536)break;cl=cl*10+(unsigned)(*cl_hdr++-'0');}}
-     if(hdr_len+cl>=sizeof(c->input)){response(c,"413 Payload Too Large","text/plain","Request too large",17);}
+     if(hdr_len+cl>=sizeof(c->input)){wlog_http_rej(a,"413",c->input);response(c,"413 Payload Too Large","text/plain","Request too large",17);}
      else if(c->used>=hdr_len+cl){dispatch(a,c);}
     }else if(c->used==sizeof(c->input)-1){
-     response(c,"431 Request Header Fields Too Large","text/plain","Request too large",17);
+     wlog_http_rej(a,"431",c->input);response(c,"431 Request Header Fields Too Large","text/plain","Request too large",17);
     }
    }
   }
@@ -1274,10 +1464,15 @@ void*bta_worker(void*arg){
   if(!resolve("sceKernelGetSystemSwVersion",&getver)&&getver&&!getver(&sw)){sw.text[27]=0;swv=sw.version;}
   diag_init(&a.diag,a.sleep,a.clock,a.map,a.unmap,swv?sw.text:"unknown");
   if(wlog_begin(&a,t0,"worker_start")){
+   struct bta_launch_trace lt;memset(&lt,0,sizeof(lt));
+   long lfd=sc3(5,(long)"/data/bta_audio/launcher.bin",0,0);
+   if(lfd>=0){sc3(3,lfd,(long)&lt,sizeof(lt));closefd(lfd);}
    wlog_raw(&a,"v=" BTA_VERSION " fw=");wlog_str(&a,swv?sw.text:"unknown");wlog_raw(&a," fw_hex=");wlog_hex(&a,swv);
    wlog_raw(&a," hdmi_fd=");wlog_dec(&a,a.hdmi);wlog_raw(&a," tv=");wlog_dec(&a,a.tv);
-   wlog_raw(&a," vol=");wlog_dec(&a,a.volume);wlog_raw(&a," joint=");wlog_dec(&a,a.joint);
+   wlog_raw(&a," vol=");wlog_dec(&a,a.volume);wlog_raw(&a," vol_rc=");wlog_dec(&a,a.load_vol_rc);
+   wlog_raw(&a," tgt_rc=");wlog_dec(&a,a.load_target_rc);wlog_raw(&a," joint=");wlog_dec(&a,a.joint);
    wlog_raw(&a," no_widen=");wlog_dec(&a,a.no_widen);
+   if(lt.magic==BTA_LAUNCH_MAGIC){wlog_raw(&a," launch=");wlog_dec(&a,lt.stage);wlog_raw(&a,"/");wlog_dec(&a,lt.rc);wlog_raw(&a,"/");wlog_dec(&a,(long)lt.bytes);}
    if(a.target.address){wlog_raw(&a," saved=");wlog_mac(&a,a.target.address);wlog_raw(&a," name=");wlog_str(&a,a.target.name);}
    wlog_end(&a,1);
   }
@@ -1319,6 +1514,19 @@ void*bta_worker(void*arg){
    int tv=exists(TV_ON),nw=exists(NO_WIDEN);
    a.tv=tv;
    if(nw!=a.no_widen){a.no_widen=nw;if(wlog_begin(&a,now,"no_widen_changed")){wlog_raw(&a,"no_widen=");wlog_dec(&a,nw);wlog_end(&a,1);}}
+   {int de=__atomic_load_n(&a.diag.last_err_stage,__ATOMIC_RELAXED);
+    int dc=__atomic_load_n(&a.diag.last_http_code,__ATOMIC_RELAXED);
+    if(de!=a.diag_last_err||(de==5&&dc!=a.diag_last_code)){
+     a.diag_last_err=de;a.diag_last_code=dc;
+     if(wlog_begin(&a,now,de?"WARN diag_net":"diag_net")){
+      wlog_raw(&a,"err=");wlog_dec(&a,de);wlog_raw(&a," http=");wlog_dec(&a,dc);
+      wlog_raw(&a," ip=");wlog_hex(&a,__atomic_load_n(&a.diag.resolved_ip,__ATOMIC_RELAXED));
+      wlog_raw(&a," sent=");wlog_dec(&a,(long)__atomic_load_n(&a.diag.sent_bytes,__ATOMIC_RELAXED));
+      wlog_raw(&a," fail=");wlog_dec(&a,(long)__atomic_load_n(&a.diag.failed_sends,__ATOMIC_RELAXED));
+      wlog_end(&a,0);
+     }
+    }
+   }
    wlog_flush(&a,now,0);
   }
   u64 deadline=a.poll_at<a.heartbeat?a.poll_at:a.heartbeat;

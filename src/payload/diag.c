@@ -1,5 +1,6 @@
 #include "diag.h"
 #include "../version.h"
+#include "../uid.h"
 
 #define DIAG_INTERVAL_US 3000000ULL
 #define DIAG_RELOAD_US   30000000ULL
@@ -8,6 +9,7 @@
 struct diag_url {
  char host[128];
  char path[128];
+ char uid_path[128];
  char host_hdr[140];
  u16 port;
 };
@@ -90,35 +92,27 @@ static u64 entropy64(struct diag_reporter *d) {
  return x ? x : 0x4254413444494147ULL;
 }
 
-static int is_hex16(const char *s) {
- for (int i = 0; i < 16; i++) {
-  char c = s[i];
-  if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return 0;
+static void save_client_id_disk(const char uid[10]) {
+ char tmp_path[] = DIAG_CLIENT_ID_PATH ".tmp";
+ if (!put(tmp_path, uid, BTA_UID_LEN)) {
+  sc3(128, (long)tmp_path, (long)DIAG_CLIENT_ID_PATH, 0);
  }
- return 1;
 }
 
-static void load_or_create_client_id(struct diag_reporter *d) {
+static void load_client_id_disk(struct diag_reporter *d) {
  char buf[32];
  memset(buf, 0, sizeof(buf));
  long fd = sc3(5, (long)DIAG_CLIENT_ID_PATH, 0, 0);
  if (fd >= 0) {
   long n = sc3(3, fd, (long)buf, sizeof(buf) - 1);
   closefd(fd);
-  if (n >= 16 && is_hex16(buf)) {
-   for (int i = 0; i < 16; i++) {
-    char c = buf[i];
-    if (c >= 'A' && c <= 'F') c = (char)(c + 32);
-    d->client_id[i] = c;
-   }
-   d->client_id[16] = 0;
+  if (bta_uid_normalize(buf, n, d->client_id)) {
+   d->client_id_ready = 1;
    return;
   }
- }
- fmt_hex64(entropy64(d), d->client_id);
- char tmp_path[] = DIAG_CLIENT_ID_PATH ".tmp";
- if (!put(tmp_path, d->client_id, 16)) {
-  sc3(128, (long)tmp_path, (long)DIAG_CLIENT_ID_PATH, 0);
+  if (!d->legacy_id[0]) {
+   bta_hex16_normalize(buf, n, d->legacy_id);
+  }
  }
 }
 
@@ -144,6 +138,10 @@ static void set_default_url(struct diag_url *u) {
  u32 j = 0;
  while (p[j] && j + 1 < sizeof(u->path)) { u->path[j] = p[j]; j++; }
  u->path[j] = 0;
+ const char *up = "/api/uid";
+ u32 k = 0;
+ while (up[k] && k + 1 < sizeof(u->uid_path)) { u->uid_path[k] = up[k]; k++; }
+ u->uid_path[k] = 0;
  struct diag_writer hw = {u->host_hdr, 0, sizeof(u->host_hdr)};
  dw_raw(&hw, u->host);
 }
@@ -188,15 +186,18 @@ static int parse_url_text(const char *raw, struct diag_url *u) {
   }
  }
  while (bi > 0 && base[bi - 1] == '/') bi--;
+ if (bi >= 9 && equal(base + bi - 9, "/api/logs")) {
+  bi -= 9;
+ }
  base[bi] = 0;
 
  struct diag_writer pw = {u->path, 0, sizeof(u->path)};
- if (bi >= 9 && equal(base + bi - 9, "/api/logs")) {
-  dw_raw(&pw, base);
- } else {
-  dw_raw(&pw, base);
-  dw_raw(&pw, "/api/logs");
- }
+ dw_raw(&pw, base);
+ dw_raw(&pw, "/api/logs");
+
+ struct diag_writer uw = {u->uid_path, 0, sizeof(u->uid_path)};
+ dw_raw(&uw, base);
+ dw_raw(&uw, "/api/uid");
 
  struct diag_writer hw = {u->host_hdr, 0, sizeof(u->host_hdr)};
  dw_raw(&hw, u->host);
@@ -489,7 +490,8 @@ static int parse_content_length(const char *headers, u32 *cl_out, int *close_out
  return has_cl;
 }
 
-static int read_http_response(struct diag_reporter *d, long fd, int timeout_ms, int *keep_alive) {
+static int read_http_response_body(struct diag_reporter *d, long fd, int timeout_ms, int *keep_alive,
+                                   char *body_out, u32 body_cap) {
  char resp[1024];
  u32 used = 0;
  char *hdr_end = 0;
@@ -520,26 +522,116 @@ static int read_http_response(struct diag_reporter *d, long fd, int timeout_ms, 
 
  u32 hdr_bytes = (u32)(hdr_end + 4 - resp);
  u32 body_have = used - hdr_bytes;
+ u32 boff = 0;
+ if (body_out && body_cap > 1) {
+  u32 copy_n = body_have < (body_cap - 1) ? body_have : (body_cap - 1);
+  if (copy_n) memcpy(body_out, hdr_end + 4, copy_n);
+  boff = copy_n;
+  body_out[boff] = 0;
+ }
  u32 cl = 0;
  int conn_close = 0;
  int has_cl = parse_content_length(resp, &cl, &conn_close);
 
- if (has_cl && !conn_close && cl <= 8192) {
+ if (has_cl && cl <= 8192) {
   u32 rem = (cl > body_have) ? (cl - body_have) : 0;
   char drain[512];
   while (rem > 0) {
    if (poll_fd(d, fd, 1, timeout_ms) <= 0) { *keep_alive = 0; break; }
    u32 want = rem < sizeof(drain) ? rem : (u32)sizeof(drain);
    long n = sc3(3, fd, (long)drain, want);
-   if (n > 0) rem -= (u32)n;
-   else if (n == -35) continue;
+   if (n > 0) {
+    if (body_out && body_cap > 1 && boff + 1 < body_cap) {
+     u32 space = body_cap - 1 - boff;
+     u32 take = (u32)n < space ? (u32)n : space;
+     memcpy(body_out + boff, drain, take);
+     boff += take;
+     body_out[boff] = 0;
+    }
+    rem -= (u32)n;
+   } else if (n == -35) continue;
    else { *keep_alive = 0; break; }
   }
-  if (rem == 0) *keep_alive = 1;
+  if (rem == 0) *keep_alive = !conn_close;
+ } else if (body_out && body_cap > 1) {
+  char drain[256];
+  for (;;) {
+   if (poll_fd(d, fd, 1, timeout_ms) <= 0) break;
+   long n = sc3(3, fd, (long)drain, sizeof(drain));
+   if (n > 0) {
+    if (boff + 1 < body_cap) {
+     u32 space = body_cap - 1 - boff;
+     u32 take = (u32)n < space ? (u32)n : space;
+     memcpy(body_out + boff, drain, take);
+     boff += take;
+     body_out[boff] = 0;
+    }
+   } else if (n == -35) continue;
+   else break;
+  }
+  *keep_alive = 0;
  } else {
   *keep_alive = 0;
  }
  return status;
+}
+
+static int read_http_response(struct diag_reporter *d, long fd, int timeout_ms, int *keep_alive) {
+ return read_http_response_body(d, fd, timeout_ms, keep_alive, 0, 0);
+}
+
+static int request_server_uid(struct diag_reporter *d, const struct diag_url *u,
+                              u32 ip, long *sock_io, int timeout_ms) {
+ char hdr[1024];
+ struct diag_writer w = {hdr, 0, sizeof(hdr)};
+ dw_raw(&w, "POST ");
+ dw_raw(&w, u->uid_path);
+ dw_raw(&w, "?version="); dw_url_enc(&w, BTA_VERSION);
+ dw_raw(&w, "&fw="); dw_url_enc(&w, d->fw);
+ if (d->legacy_id[0]) { dw_raw(&w, "&legacy="); dw_url_enc(&w, d->legacy_id); }
+ dw_raw(&w, " HTTP/1.1\r\nHost: ");
+ dw_raw(&w, u->host_hdr);
+ dw_raw(&w, "\r\nUser-Agent: BTAudio4/" BTA_VERSION "\r\n"
+            "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+
+ for (int attempt = 0; attempt < 2; attempt++) {
+  int reused = (*sock_io >= 0);
+  if (*sock_io < 0) {
+   *sock_io = tcp_connect_nb(d, ip, u->port, timeout_ms);
+   if (*sock_io < 0) return -1;
+  }
+  int ka = 0;
+  char body[512];
+  body[0] = 0;
+  if (write_nb(d, *sock_io, (const u8 *)hdr, w.used, timeout_ms) == 0) {
+   int code = read_http_response_body(d, *sock_io, timeout_ms, &ka, body, sizeof(body));
+   if (!ka) { closefd(*sock_io); *sock_io = -1; }
+   if (code >= 200 && code < 300 && bta_extract_uid_json(body, d->client_id)) {
+    d->client_id_ready = 1;
+    return 0;
+   }
+   if (code > 0) return -1;
+  }
+  closefd(*sock_io);
+  *sock_io = -1;
+  if (!reused) break;
+ }
+ return -1;
+}
+
+static void ensure_diag_client_id(struct diag_reporter *d, const struct diag_url *u,
+                                  u32 ip, long *sock_io, int has_ip, int running) {
+ if (d->client_id_ready) return;
+ load_client_id_disk(d);
+ if (d->client_id_ready) return;
+ if (has_ip && running) {
+  request_server_uid(d, u, ip, sock_io, 2500);
+ }
+ if (!d->client_id_ready) {
+  bta_uid_from_u64(entropy64(d), d->client_id);
+  d->client_id_ready = 1;
+ }
+ save_client_id_disk(d->client_id);
 }
 
 static int send_http_chunk(struct diag_reporter *d, const struct diag_url *u,
@@ -575,7 +667,12 @@ static int send_http_chunk(struct diag_reporter *d, const struct diag_url *u,
       write_nb(d, *sock_io, chunk, len, timeout_ms) == 0) {
    int code = read_http_response(d, *sock_io, timeout_ms, &ka);
    if (!ka) { closefd(*sock_io); *sock_io = -1; }
-   if (code >= 200 && code < 300) return 0;
+   if (code >= 200 && code < 300) {
+    __atomic_store_n(&d->last_err_stage, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&d->last_http_code, code, __ATOMIC_RELAXED);
+    return 0;
+   }
+   if (code > 0) __atomic_store_n(&d->last_http_code, code, __ATOMIC_RELAXED);
    if (code == 400 || code == 413 || code == 414) return -3;
    if (code > 0) return -2; /* server rejected, do not immediately reconnect */
   }
@@ -659,19 +756,21 @@ static void *diag_thread(void *arg) {
    continue;
   }
 
-  if (!has_ip || (running && now - dns_at >= DIAG_DNS_TTL_US)) {
+   if (!has_ip || (running && now - dns_at >= DIAG_DNS_TTL_US)) {
    u32 ip = 0;
    if (!resolve_host(d, url.host, &ip)) {
     cached_ip = ip;
     has_ip = 1;
     dns_at = d->clock();
     consec_fails = 0;
+    __atomic_store_n(&d->resolved_ip, ip, __ATOMIC_RELAXED);
    } else if (!has_ip) {
     has_ip = 0;
    }
   }
 
   if (!has_ip) {
+   __atomic_store_n(&d->last_err_stage, 1, __ATOMIC_RELAXED);
    __atomic_fetch_add(&d->failed_sends, 1, __ATOMIC_RELAXED);
    if (!running) break;
    backoff_ms = backoff_ms ? (backoff_ms * 2) : 2000;
@@ -680,6 +779,8 @@ static void *diag_thread(void *arg) {
    d->sleep(200000);
    continue;
   }
+
+  ensure_diag_client_id(d, &url, cached_ip, &sock, has_ip, running);
 
   u64 cur_drop_ev = __atomic_load_n(&d->dropped, __ATOMIC_RELAXED);
   u64 cur_drop_bytes = __atomic_load_n(&d->dropped_bytes, __ATOMIC_RELAXED);
@@ -712,6 +813,7 @@ static void *diag_thread(void *arg) {
     backoff_ms = 0;
     consec_fails = 0;
    } else {
+    __atomic_store_n(&d->last_err_stage, (rc == -2 || rc == -3) ? 5 : 3, __ATOMIC_RELAXED);
     __atomic_fetch_add(&d->failed_sends, 1, __ATOMIC_RELAXED);
    }
    u32 cur_head = __atomic_load_n(&d->head, __ATOMIC_ACQUIRE);
@@ -768,7 +870,7 @@ void diag_init(struct diag_reporter *d,
  d->cap = DIAG_RING_SIZE;
  d->next_seq = 1;
 
- load_or_create_client_id(d);
+ load_client_id_disk(d);
  fmt_hex64(entropy64(d), d->session_id);
 
  int (*create)(void **, void **, void *(*)(void *), void *, const char *) = 0;

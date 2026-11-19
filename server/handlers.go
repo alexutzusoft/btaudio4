@@ -8,14 +8,58 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-const maxChunkBytes = 1 << 20 // 1 MiB safety cap per request
+const (
+	maxChunkBytes       = 1 << 20 // 1 MiB safety cap per request
+	uidRateWindow       = 1 * time.Minute
+	uidRateMaxPerWindow = 120
+)
+
+type uidLimiter struct {
+	mu      sync.Mutex
+	buckets map[string][]time.Time
+}
+
+func newUIDLimiter() *uidLimiter {
+	return &uidLimiter{buckets: make(map[string][]time.Time)}
+}
+
+func (l *uidLimiter) allow(ip string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := now.Add(-uidRateWindow)
+	if len(l.buckets) > 1024 {
+		for k, ts := range l.buckets {
+			if len(ts) == 0 || ts[len(ts)-1].Before(cutoff) {
+				delete(l.buckets, k)
+			}
+		}
+	}
+	ts := l.buckets[ip]
+	keep := 0
+	for _, t := range ts {
+		if !t.Before(cutoff) {
+			ts[keep] = t
+			keep++
+		}
+	}
+	ts = ts[:keep]
+	if len(ts) >= uidRateMaxPerWindow {
+		l.buckets[ip] = ts
+		return false
+	}
+	l.buckets[ip] = append(ts, now)
+	return true
+}
 
 type Server struct {
 	store   *Store
 	verbose bool
 	mux     *http.ServeMux
+	uidLim  *uidLimiter
 }
 
 func NewServer(store *Store, verbose bool) *Server {
@@ -23,7 +67,9 @@ func NewServer(store *Store, verbose bool) *Server {
 		store:   store,
 		verbose: verbose,
 		mux:     http.NewServeMux(),
+		uidLim:  newUIDLimiter(),
 	}
+	sv.mux.HandleFunc("POST /api/uid", sv.handleAllocateUID)
 	sv.mux.HandleFunc("POST /api/logs", sv.handleIngest)
 	sv.mux.HandleFunc("GET /healthz", sv.handleHealth)
 	return sv
@@ -55,6 +101,41 @@ func paramOrHeader(r *http.Request, queryKey, headerKey string) string {
 		return v
 	}
 	return r.Header.Get(headerKey)
+}
+
+func (sv *Server) handleAllocateUID(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	_, _ = io.Copy(io.Discard, r.Body)
+
+	ip := clientIP(r)
+	if !sv.uidLim.allow(ip, time.Now()) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	in := UIDInput{
+		Version:      paramOrHeader(r, "version", "X-BTA-Version"),
+		Firmware:     paramOrHeader(r, "fw", "X-BTA-FW"),
+		RemoteIP:     ip,
+		LegacyClient: paramOrHeader(r, "legacy", "X-BTA-Legacy"),
+	}
+	rec, err := sv.store.AllocateUID(in)
+	if err != nil {
+		log.Printf("uid allocation error ip=%s: %v", ip, err)
+		http.Error(w, "storage error", http.StatusInternalServerError)
+		return
+	}
+	if sv.verbose {
+		log.Printf("uid allocated uid=%s version=%s fw=%s legacy=%s ip=%s",
+			rec.UID, rec.Version, rec.Firmware, rec.LegacyClient, rec.RemoteIP)
+	}
+	writeJSON(w, http.StatusOK, struct {
+		OK  bool   `json:"ok"`
+		UID string `json:"uid"`
+	}{
+		OK:  true,
+		UID: rec.UID,
+	})
 }
 
 func (sv *Server) handleIngest(w http.ResponseWriter, r *http.Request) {

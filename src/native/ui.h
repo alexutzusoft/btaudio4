@@ -27,7 +27,7 @@ static uint32_t back[WIDTH*HEIGHT]; /* cached off-screen target; the video buffe
 static struct bt_native state;
 static int online,ext_ok,focus,top,meter_s,upd_state,upd_has_pkg,dl_state;
 static uint64_t g_now,testing_until,notice_until,dl_bytes,dl_total;
-static char notice[160],upd_latest[64],dl_pkg_name[128],dl_err[160];
+static char notice[160],upd_latest[64],dl_pkg_name[128],dl_err[160],client_uid[16];
 
 /* ---- drawing primitives. The PC previewer mirrors these exactly (integer math). ---- */
 static int cx0,cy0,cx1=WIDTH,cy1=HEIGHT;
@@ -248,7 +248,11 @@ static void draw_header(void){
   fill(x-17,30,1,28,TRACK);
   right=x-33;
  }
- text_r(F_SMALL,right,49,"v" BTA_VERSION,MUTED);
+ text_r(F_SMALL,right,39,"v" BTA_VERSION,MUTED);
+ const char*uid_val=client_uid[0]?client_uid:"...";
+ int lw=text_w(F_SMALL,"UID "),uw=text_w(F_SMALLB,uid_val);
+ text(F_SMALL,right-lw-uw,58,"UID ",MUTED);
+ text(F_SMALLB,right-uw,58,uid_val,client_uid[0]?TEXT:MUTED);
 }
 
 static void draw_playback(int l,const struct bt_device*target,int pinmode,uint64_t now){

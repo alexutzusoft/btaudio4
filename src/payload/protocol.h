@@ -28,8 +28,11 @@ static inline int bt_is_audio(const struct bt_device*d){return (d->services&8)||
 #define BT_CONN_SNAP_LIMIT 8
 struct bt_conn_slot {
  unsigned long bdaddr;
- unsigned state,policy,dev_services;
+ unsigned state,policy,dev_services,dev_flags,dev_cod;
  unsigned short handle,stream_ok;
+ int min_bp,max_bp;
+ unsigned st_dropped;
+ int st_inflight,st_queued,st_frames,st_bitpool,st_enc_bp;
 };
 struct bt_prep_diag {
  int rc,skipped;
@@ -52,10 +55,32 @@ struct bt_stream_diag {
  int slot_count;
  struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
 };
+struct bt_full_diag {
+ int rc;
+ int slot_count;
+ int target_found;
+ int pad;
+ unsigned long dev_ptr;
+ unsigned long conn_ptr;
+ unsigned long stream_ptr;
+ struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
+ unsigned char dev_raw[160];
+ unsigned char conn_hdr[64];
+ unsigned char conn_tail[64];
+ unsigned char stream_cfg[128];
+};
+#define BTA_LAUNCH_MAGIC 0x01434e4c41544255ULL
+struct bta_launch_trace {
+ unsigned long magic;
+ int stage;
+ int rc;
+ unsigned long bytes;
+};
 struct bt_koff;
 int bt_list(struct bt_devices*);
 int bt_prepare(unsigned long address);
 int bt_prepare_diag(unsigned long address, struct bt_prep_diag *diag);
 int bt_stream_tune(unsigned long address, int target_bp, struct bt_stream_diag *diag);
+int bt_full_diag(unsigned long address, struct bt_full_diag *diag);
 const struct bt_koff *bt_koff_info(void);
 #endif

@@ -26,6 +26,7 @@ struct input {
     struct bt_devices *out;
     struct bt_prep_diag *diag;
     struct bt_stream_diag *sdiag;
+    struct bt_full_diag *fdiag;
 };
 struct args {
     void *fn;
@@ -55,6 +56,12 @@ static int resolve_cb(void *td, struct resolve_args *a) {
     return bad ? 102 : cprc;
 }
 
+static void copy_bytes(void *dst, const void *src, u64 n) {
+    u8 *d = (u8 *)dst;
+    const u8 *s = (const u8 *)src;
+    for (u64 i = 0; i < n; i++) d[i] = s[i];
+}
+
 static int snap_conn_slots(const struct bt_koff *k, unsigned char *ctx, struct bt_conn_slot *slots) {
     int count = 0;
     for (unsigned off = k->conn_off; off < k->conn_end && count < BT_CONN_SNAP_LIMIT; off += k->conn_stride) {
@@ -66,10 +73,26 @@ static int snap_conn_slots(const struct bt_koff *k, unsigned char *ctx, struct b
         s->state = *(unsigned *)(c + k->conn_state_off);
         s->policy = *(unsigned *)(c + k->conn_policy_off);
         s->handle = *(unsigned short *)(c + k->conn_handle_off);
+        s->min_bp = *(int *)(c + k->conn_min_bp_off);
+        s->max_bp = *(int *)(c + k->conn_max_bp_off);
         unsigned char *d = *(void **)(c + k->conn_dev_off);
-        s->dev_services = (d && ((u64)d >> 48) == 0xffff) ? *(unsigned *)(d + 0x20) : 0xffffffffU;
+        if (d && ((u64)d >> 48) == 0xffff) {
+            s->dev_cod = *(unsigned *)(d + 8);
+            s->dev_services = *(unsigned *)(d + 0x20);
+            s->dev_flags = *(unsigned *)(d + 0x24);
+        } else {
+            s->dev_services = 0xffffffffU;
+        }
         unsigned char *st = k->conn_stream_off ? *(void **)(c + k->conn_stream_off) : 0;
-        s->stream_ok = (st && ((u64)st >> 48) == 0xffff) ? 1 : 0;
+        if (st && ((u64)st >> 48) == 0xffff) {
+            s->stream_ok = 1;
+            if (k->stream_dropped_off) s->st_dropped = *(unsigned *)(st + k->stream_dropped_off);
+            if (k->stream_inflight_off) s->st_inflight = *(int *)(st + k->stream_inflight_off);
+            if (k->stream_queued_off) s->st_queued = *(int *)(st + k->stream_queued_off);
+            if (k->stream_frames_off) s->st_frames = *(int *)(st + k->stream_frames_off);
+            if (k->stream_bitpool_off) s->st_bitpool = *(int *)(st + k->stream_bitpool_off);
+            if (k->stream_enc_bp_off) s->st_enc_bp = *(int *)(st + k->stream_enc_bp_off);
+        }
     }
     return count;
 }
@@ -91,8 +114,8 @@ static int callback(void *td, struct args *a) {
     u64 address = in->address;
     int mode = in->mode;
     struct bt_devices *destination = in->out;
-    if (mode < 0 || mode > 2) return 22;
-    if (mode >= 1 && (!address || address >> 48)) return 22;
+    if (mode < 0 || mode > 3) return 22;
+    if ((mode == 1 || mode == 2) && (!address || address >> 48)) return 22;
 
     struct bt_devices out;
     zero_mem(&out, sizeof(out));
@@ -173,7 +196,7 @@ static int callback(void *td, struct args *a) {
             break;
         }
         d_out.rc = rc;
-        if (rc != 0 && in->diag) {
+        if (in->diag) {
             d_out.slot_count = snap_conn_slots(k, ctx, d_out.slots);
         }
         unlock(0);
@@ -183,7 +206,7 @@ static int callback(void *td, struct args *a) {
             if (cprc && !rc) rc = cprc;
         }
         return rc;
-    } else {
+    } else if (mode == 2) {
         struct bt_stream_diag s_out;
         zero_mem(&s_out, sizeof(s_out));
         rc = 2;
@@ -242,6 +265,43 @@ static int callback(void *td, struct args *a) {
             if (cprc && !rc) rc = cprc;
         }
         return rc;
+    } else {
+        struct bt_full_diag f_out;
+        zero_mem(&f_out, sizeof(f_out));
+        f_out.slot_count = snap_conn_slots(k, ctx, f_out.slots);
+        rc = 0;
+        if (address && !(address >> 48)) {
+            for (unsigned off = k->conn_off; off < k->conn_end; off += k->conn_stride) {
+                unsigned char *c = ctx + off;
+                if (*(u64 *)(c + k->conn_bdaddr_off) != address) continue;
+                f_out.target_found = 1;
+                f_out.conn_ptr = (u64)c;
+                copy_bytes(f_out.conn_hdr, c, sizeof(f_out.conn_hdr));
+                u32 tail_off = (k->conn_state_off >= 32) ? (k->conn_state_off - 32) : 0;
+                if (tail_off + sizeof(f_out.conn_tail) <= k->conn_stride) {
+                    copy_bytes(f_out.conn_tail, c + tail_off, sizeof(f_out.conn_tail));
+                }
+                unsigned char *d = *(void **)(c + k->conn_dev_off);
+                if (d && ((u64)d >> 48) == 0xffff) {
+                    f_out.dev_ptr = (u64)d;
+                    copy_bytes(f_out.dev_raw, d, sizeof(f_out.dev_raw));
+                }
+                unsigned char *st = k->conn_stream_off ? *(void **)(c + k->conn_stream_off) : 0;
+                if (st && ((u64)st >> 48) == 0xffff) {
+                    f_out.stream_ptr = (u64)st;
+                    copy_bytes(f_out.stream_cfg, st, sizeof(f_out.stream_cfg));
+                }
+                break;
+            }
+        }
+        f_out.rc = rc;
+        unlock(0);
+        if (in->fdiag) {
+            int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
+            int cprc = copyout(&f_out, in->fdiag, sizeof(f_out));
+            if (cprc) rc = cprc;
+        }
+        return rc;
     }
 
     unlock(0);
@@ -277,6 +337,11 @@ int bt_prepare(u64 address) {
 
 int bt_stream_tune(u64 address, int target_bp, struct bt_stream_diag *diag) {
     struct input in = {.address = address, .mode = 2, .target_bp = target_bp, .sdiag = diag};
+    return invoke(&in);
+}
+
+int bt_full_diag(u64 address, struct bt_full_diag *diag) {
+    struct input in = {.address = address, .mode = 3, .fdiag = diag};
     return invoke(&in);
 }
 

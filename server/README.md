@@ -25,7 +25,8 @@ go build -o btaudio4-server .
 
 ## Endpoints
 
-- `POST /api/logs` — Receives raw log chunks (`text/plain`) with query params `client`, `session`, `seq`, `offset`, `version`, `fw`. Deduplicates retries by byte offset.
+- `POST /api/uid` — Allocates and persists a unique `CCCC-CCCC` console UID (`<data>/clients/<uid>.json`) with optional `version`, `fw`, and `legacy` params.
+- `POST /api/logs` — Receives raw log chunks (`text/plain`) with query params `client`, `session`, `seq`, `offset`, `version`, `fw`. Deduplicates retries by byte offset and stores sessions under `<data>/sessions/<client>/<session>.log`.
 - `GET /healthz` — Health check (`ok`).
 
 ## Overriding the Server URL on PS4

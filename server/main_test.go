@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -244,5 +246,109 @@ func TestKindAndClientDroppedMetadata(t *testing.T) {
 	}
 	if meta.Kind != "app" || meta.ClientDropped != 4 || meta.Version != "1.10" {
 		t.Fatalf("unexpected meta: %+v", meta)
+	}
+}
+
+func TestAllocateUIDAndSessionGrouping(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	sv := NewServer(store, false)
+	ts := httptest.NewServer(sv)
+	defer ts.Close()
+
+	const nClients = 20
+	seen := make(map[string]struct{}, nClients)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < nClients; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			url := fmt.Sprintf("%s/api/uid?version=1.12&fw=14.02&legacy=0123456789abcdef", ts.URL)
+			resp, err := http.Post(url, "application/json", nil)
+			if err != nil {
+				t.Errorf("POST /api/uid: %v", err)
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status=%d, want 200", resp.StatusCode)
+				return
+			}
+			var out struct {
+				OK  bool   `json:"ok"`
+				UID string `json:"uid"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+				t.Errorf("decode: %v", err)
+				return
+			}
+			norm, ok := NormalizeUID(out.UID)
+			if !ok || norm != out.UID {
+				t.Errorf("invalid uid %q", out.UID)
+				return
+			}
+			mu.Lock()
+			if _, dup := seen[out.UID]; dup {
+				t.Errorf("duplicate uid %q", out.UID)
+			}
+			seen[out.UID] = struct{}{}
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	if len(seen) != nClients {
+		t.Fatalf("allocated %d uids, want %d", len(seen), nClients)
+	}
+
+	var sampleUID string
+	for uid := range seen {
+		sampleUID = uid
+		break
+	}
+
+	// Upload logs using lowercase UID to verify canonical uppercase grouping.
+	logBody := "[+0.1s] uid test line\n"
+	logURL := fmt.Sprintf("%s/api/logs?client=%s&session=sessA&seq=1&offset=0&version=1.12",
+		ts.URL, strings.ToLower(sampleUID))
+	resp, err := http.Post(logURL, "text/plain; charset=utf-8", strings.NewReader(logBody))
+	if err != nil {
+		t.Fatalf("POST /api/logs: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/logs status=%d, want 200", resp.StatusCode)
+	}
+
+	sessionPath := filepath.Join(dir, "sessions", sampleUID, "sessA.log")
+	if _, err := os.Stat(sessionPath); err != nil {
+		t.Fatalf("expected session log at %s: %v", sessionPath, err)
+	}
+
+	store.Close()
+
+	// Reopen store and verify allocated UIDs and session logs reload cleanly.
+	store2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore reload: %v", err)
+	}
+	defer store2.Close()
+
+	store2.mu.RLock()
+	rec, ok := store2.clients[sampleUID]
+	store2.mu.RUnlock()
+	if !ok || rec.UID != sampleUID || rec.Version != "1.12" || rec.LegacyClient != "0123456789abcdef" {
+		t.Fatalf("reloaded client record mismatch: ok=%v rec=%+v", ok, rec)
+	}
+
+	got, meta, err := store2.ReadLog(sampleUID, "sessA", 0)
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	if string(got) != logBody || meta.ClientID != sampleUID {
+		t.Fatalf("ReadLog mismatch: got=%q meta=%+v", string(got), meta)
 	}
 }

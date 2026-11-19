@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,26 @@ const (
 	idleFileTTL         = 2 * time.Minute
 	janitorInterval     = 1 * time.Minute
 	maxOpenSessionFiles = 256
+	uidAlphabet         = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 )
+
+// ClientRecord describes a persistent console UID issued by the server.
+type ClientRecord struct {
+	UID          string    `json:"uid"`
+	CreatedAt    time.Time `json:"created_at"`
+	Version      string    `json:"version,omitempty"`
+	Firmware     string    `json:"fw,omitempty"`
+	RemoteIP     string    `json:"remote_ip,omitempty"`
+	LegacyClient string    `json:"legacy_client,omitempty"`
+}
+
+// UIDInput holds optional metadata supplied when allocating a console UID.
+type UIDInput struct {
+	Version      string
+	Firmware     string
+	RemoteIP     string
+	LegacyClient string
+}
 
 // SessionMeta describes one PS4 payload run's diagnostic log stream.
 type SessionMeta struct {
@@ -71,13 +91,15 @@ type sessionState struct {
 
 // Store persists incoming log chunks per (client, session) safely and idempotently.
 type Store struct {
-	root      string
-	mu        sync.RWMutex
-	sessions  map[string]*sessionState
-	closed    bool
-	openFiles atomic.Int64
-	stopCh    chan struct{}
-	doneCh    chan struct{}
+	root       string
+	clientsDir string
+	mu         sync.RWMutex
+	sessions   map[string]*sessionState
+	clients    map[string]ClientRecord
+	closed     bool
+	openFiles  atomic.Int64
+	stopCh     chan struct{}
+	doneCh     chan struct{}
 }
 
 func NewStore(dataDir string) (*Store, error) {
@@ -85,11 +107,17 @@ func NewStore(dataDir string) (*Store, error) {
 	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create sessions dir: %w", err)
 	}
+	clientsDir := filepath.Join(dataDir, "clients")
+	if err := os.MkdirAll(clientsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create clients dir: %w", err)
+	}
 	s := &Store{
-		root:     sessionsDir,
-		sessions: make(map[string]*sessionState),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		root:       sessionsDir,
+		clientsDir: clientsDir,
+		sessions:   make(map[string]*sessionState),
+		clients:    make(map[string]ClientRecord),
+		stopCh:     make(chan struct{}),
+		doneCh:     make(chan struct{}),
 	}
 	if err := s.loadExisting(); err != nil {
 		return nil, err
@@ -110,6 +138,36 @@ func (s *Store) janitorLoop() {
 			s.CloseIdleFiles(idleFileTTL)
 		}
 	}
+}
+
+// NormalizeUID validates a CCCC-CCCC alphanumeric UID and normalizes letters to uppercase.
+func NormalizeUID(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) != 9 || raw[4] != '-' {
+		return "", false
+	}
+	var b [9]byte
+	for i := 0; i < 9; i++ {
+		c := raw[i]
+		if i == 4 {
+			b[i] = '-'
+			continue
+		}
+		if c >= 'a' && c <= 'z' {
+			c -= 32
+		} else if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')) {
+			return "", false
+		}
+		b[i] = c
+	}
+	return string(b[:]), true
+}
+
+func normalizeClientID(raw, fallback string) string {
+	if uid, ok := NormalizeUID(raw); ok {
+		return uid
+	}
+	return sanitizeID(raw, fallback, 64)
 }
 
 func sanitizeID(raw string, fallback string, maxLen int) string {
@@ -201,7 +259,97 @@ func (s *Store) loadExisting() error {
 			}
 		}
 	}
+	if cEntries, err := os.ReadDir(s.clientsDir); err == nil {
+		for _, entry := range cEntries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			uid, ok := NormalizeUID(strings.TrimSuffix(entry.Name(), ".json"))
+			if !ok {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(s.clientsDir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			var rec ClientRecord
+			if json.Unmarshal(raw, &rec) == nil {
+				rec.UID = uid
+				s.clients[uid] = rec
+			}
+		}
+	}
 	return nil
+}
+
+func randomUID() (string, error) {
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", err
+	}
+	var out [9]byte
+	for i := 0; i < 8; i++ {
+		pos := i
+		if i >= 4 {
+			pos++
+		}
+		out[pos] = uidAlphabet[rnd[i]&31]
+	}
+	out[4] = '-'
+	return string(out[:]), nil
+}
+
+// AllocateUID generates and persists a unique CCCC-CCCC console UID.
+func (s *Store) AllocateUID(in UIDInput) (ClientRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ClientRecord{}, errors.New("store closed")
+	}
+
+	var uid string
+	for attempt := 0; attempt < 32; attempt++ {
+		candidate, err := randomUID()
+		if err != nil {
+			return ClientRecord{}, fmt.Errorf("generate uid: %w", err)
+		}
+		if _, exists := s.clients[candidate]; exists {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(s.root, candidate)); err == nil {
+			continue
+		}
+		uid = candidate
+		break
+	}
+	if uid == "" {
+		return ClientRecord{}, errors.New("could not allocate unique uid")
+	}
+
+	rec := ClientRecord{
+		UID:          uid,
+		CreatedAt:    time.Now().UTC(),
+		Version:      sanitizeText(in.Version, 32),
+		Firmware:     sanitizeText(in.Firmware, 32),
+		RemoteIP:     sanitizeText(in.RemoteIP, 64),
+		LegacyClient: sanitizeID(in.LegacyClient, "", 64),
+	}
+
+	raw, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return ClientRecord{}, err
+	}
+	finalPath := filepath.Join(s.clientsDir, uid+".json")
+	tmpPath := finalPath + ".tmp"
+	if err := os.WriteFile(tmpPath, raw, 0o644); err != nil {
+		return ClientRecord{}, fmt.Errorf("write uid record: %w", err)
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return ClientRecord{}, fmt.Errorf("save uid record: %w", err)
+	}
+	s.clients[uid] = rec
+	return rec, nil
 }
 
 func (s *Store) getOrCreate(clientID, sessionID string) (*sessionState, error) {
@@ -277,7 +425,7 @@ func (st *sessionState) persistMetaLocked(now time.Time, force bool) error {
 
 // AppendChunk appends a chunk of logs with offset-based deduplication and gap tracking.
 func (s *Store) AppendChunk(in ChunkInput) (AppendResult, error) {
-	clientID := sanitizeID(in.ClientID, "unknown", 64)
+	clientID := normalizeClientID(in.ClientID, "unknown")
 	sessionID := sanitizeID(in.SessionID, "default", 64)
 	st, err := s.getOrCreate(clientID, sessionID)
 	if err != nil {
@@ -405,7 +553,7 @@ func (s *Store) ListSessions(limit int) []SessionMeta {
 
 // ReadLog reads up to the last tailBytes of a session log (or the entire log when tailBytes <= 0).
 func (s *Store) ReadLog(clientID, sessionID string, tailBytes int64) ([]byte, SessionMeta, error) {
-	c := sanitizeID(clientID, "", 64)
+	c := normalizeClientID(clientID, "")
 	sid := sanitizeID(sessionID, "", 64)
 	if c == "" || sid == "" {
 		return nil, SessionMeta{}, os.ErrNotExist

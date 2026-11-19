@@ -16,7 +16,7 @@ struct result {
     u64 before, after;
     u64 base, rx_start, rx_len, copyout_fn, site_addr;
     u32 fail_step, pad;
-    u8 surround[24];
+    u8 surround[64];
 };
 struct patch_args { struct result *out; };
 struct args { void *fn; struct patch_args *pa; };
@@ -38,13 +38,24 @@ static int patch(void *td, struct args *a) {
     if (!out.site_addr) {
         out.fail_step = 4;
         rc = 22;
+        u64 err_site = kr_find_bt_err_site(out.rx_start, out.rx_len);
+        if (err_site) {
+            u64 da = (err_site > out.rx_start + 48) ? (err_site - 48) : out.rx_start;
+            u64 avail = (out.rx_start + out.rx_len) - da;
+            u64 n = avail < sizeof(out.surround) ? avail : sizeof(out.surround);
+            const u8 *sb = (const u8 *)da;
+            for (u64 i = 0; i < n; i++) out.surround[i] = sb[i];
+        }
     } else {
         volatile u64 *site = (volatile u64 *)out.site_addr;
         u64 cur = *site;
         out.before = cur;
         out.after = cur;
-        const u8 *sb = (const u8 *)(out.site_addr - 8);
-        for (u64 i = 0; i < sizeof(out.surround); i++) out.surround[i] = sb[i];
+        u64 da = (out.site_addr > out.rx_start + 24) ? (out.site_addr - 24) : out.rx_start;
+        u64 avail = (out.rx_start + out.rx_len) - da;
+        u64 n = avail < sizeof(out.surround) ? avail : sizeof(out.surround);
+        const u8 *sb = (const u8 *)da;
+        for (u64 i = 0; i < n; i++) out.surround[i] = sb[i];
         /* cmp dword [rax+0x20],0x40; jne reject; first 2 bytes of next insn.
          * -> test byte [rax+0x20],0x48; je reject. 0x40 = HID, 0x08 = audio.
          * Preserve byte 5 (<rel8>) and bytes [6..7] (49 8b) across firmware variants. */

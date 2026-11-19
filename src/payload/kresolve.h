@@ -50,6 +50,10 @@ struct bt_koff {
     u64 rx_start;
     u64 rx_len;
     u64 ctx_val;
+    u64 dump_addr;
+    u32 dump_len;
+    u32 dump_sub;
+    u8 dump_bytes[256];
 };
 
 #define KR_RES_CACHE_BOUNDS (1U << 0)
@@ -63,6 +67,7 @@ u64 kr_find_base(void);
 int kr_rx_bounds(u64 base, u64 *start, u64 *len);
 u64 kr_resolve_copyout(u64 rx_start, u64 rx_len);
 u64 kr_resolve_accept_site(u64 rx_start, u64 rx_len);
+u64 kr_find_bt_err_site(u64 rx_start, u64 rx_len);
 int kr_resolve_bt(u64 base, struct bt_koff *out);
 
 #endif

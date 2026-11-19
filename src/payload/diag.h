@@ -3,7 +3,7 @@
 
 #include "runtime.h"
 
-#define DIAG_RING_SIZE 262144U
+#define DIAG_RING_SIZE 524288U
 #define DIAG_CHUNK_MAX 16384U
 #define DIAG_DEFAULT_HOST "bta.alexutzu.pro"
 #define DIAG_DEFAULT_PORT 80
@@ -35,7 +35,12 @@ struct diag_reporter {
  int (*join)(void *, void **);
  char fw[32];
  char client_id[17];
+ char legacy_id[17];
+ int client_id_ready;
  char session_id[17];
+ int last_err_stage;
+ int last_http_code;
+ u32 resolved_ip;
 };
 
 void diag_init(struct diag_reporter *d,
