@@ -101,20 +101,31 @@ static u64 scan_first(u64 start, u64 len, const s16 *pat, u64 plen) {
     return 0;
 }
 
-static u64 scan_unique(u64 start, u64 len, const s16 *pat, u64 plen) {
+static u64 scan_unique_ex(u64 start, u64 len, const s16 *pat, u64 plen, u32 *hits_out) {
     u64 first = scan_first(start, len, pat, plen);
-    if (!first) return 0;
+    if (!first) {
+        if (hits_out) *hits_out = 0;
+        return 0;
+    }
     u64 next = first + 1;
     u64 end = start + len;
-    if (next < end && scan_first(next, end - next, pat, plen)) return 0;
+    if (next < end && scan_first(next, end - next, pat, plen)) {
+        if (hits_out) *hits_out = 2;
+        return 0;
+    }
+    if (hits_out) *hits_out = 1;
     return first;
 }
 
-static u64 find_str_unique(const struct kr_range *ro, u32 n_ro, const char *s) {
+static u64 scan_unique(u64 start, u64 len, const s16 *pat, u64 plen) {
+    return scan_unique_ex(start, len, pat, plen, 0);
+}
+
+static u64 find_str_unique_ex(const struct kr_range *ro, u32 n_ro, const char *s, u32 *hits_out) {
     u64 slen = 0;
     while (s[slen]) slen++;
     slen++;
-    if (slen > 64) return 0;
+    if (slen > 64) { if (hits_out) *hits_out = 0; return 0; }
     s16 pat[64];
     for (u64 i = 0; i < slen; i++) pat[i] = (u8)s[i];
     u64 match = 0;
@@ -124,11 +135,15 @@ static u64 find_str_unique(const struct kr_range *ro, u32 n_ro, const char *s) {
         while (pos < end) {
             u64 hit = scan_first(pos, end - pos, pat, slen);
             if (!hit) break;
-            if (match) return 0;
+            if (match) {
+                if (hits_out) *hits_out = 2;
+                return 0;
+            }
             match = hit;
             pos = hit + 1;
         }
     }
+    if (hits_out) *hits_out = match ? 1 : 0;
     return match;
 }
 
@@ -178,7 +193,7 @@ static int scan_has_err(u64 start, u64 end) {
            scan_first(start, end - start, e3, sizeof(e3) / sizeof(e3[0]));
 }
 
-u64 kr_resolve_copyout(u64 rx_start, u64 rx_len) {
+static u64 kr_resolve_copyout_ex(u64 rx_start, u64 rx_len, u32 *hits_out) {
     /* John Tornblom's PS4 copyout pattern (kexec_find_copyout). */
     static const s16 pat[] = {
         0x55, 0x48, 0x89, 0xe5, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x20, 0x00, 0x00, 0x00,
@@ -187,10 +202,14 @@ u64 kr_resolve_copyout(u64 rx_start, u64 rx_len) {
         0x00, 0x48, 0x8b, 0x41, 0x08, 0x48, 0x8b, 0x88, -1, -1, -1, -1,
         0x48, 0xf7, 0xc1, 0x00, 0x00, 0x00, 0x40
     };
-    return scan_unique(rx_start, rx_len, pat, sizeof(pat) / sizeof(pat[0]));
+    return scan_unique_ex(rx_start, rx_len, pat, sizeof(pat) / sizeof(pat[0]), hits_out);
 }
 
-static int scan_accept_pat(u64 rx_start, u64 end, const s16 *pat, u64 *match) {
+u64 kr_resolve_copyout(u64 rx_start, u64 rx_len) {
+    return kr_resolve_copyout_ex(rx_start, rx_len, 0);
+}
+
+static int scan_accept_pat(u64 rx_start, u64 end, const s16 *pat, u64 *match, u32 *cnt) {
     u64 pos = rx_start;
     while (pos < end) {
         u64 hit = scan_first(pos, end - pos, pat, 8);
@@ -199,6 +218,7 @@ static int scan_accept_pat(u64 rx_start, u64 end, const s16 *pat, u64 *match) {
         u8 rex7 = *(const u8 *)(hit + 6);
         if (rex7 != 0x48 && rex7 != 0x49) { pos = hit + 1; continue; }
         if (hit + 16 < w_end && scan_has_err(hit + 16, w_end)) {
+            if (*cnt < 0xffffffffU) (*cnt)++;
             if (*match && *match != hit) return -1;
             *match = hit;
         }
@@ -207,7 +227,7 @@ static int scan_accept_pat(u64 rx_start, u64 end, const s16 *pat, u64 *match) {
     return 0;
 }
 
-u64 kr_resolve_accept_site(u64 rx_start, u64 rx_len) {
+static u64 kr_resolve_accept_site_ex(u64 rx_start, u64 rx_len, u32 *hits_out) {
     /* Accept either unpatched (cmp dword [rax+0x20],0x40; jne +??; mov ..., [r12..])
      * or already-patched (test byte [rax+0x20],0x48; je +??; mov ..., [r12..]) form,
      * anchored by the Sony BT error codes (0x802f3401/0x802f3403) right after it. */
@@ -217,19 +237,35 @@ u64 kr_resolve_accept_site(u64 rx_start, u64 rx_len) {
     static const s16 patched[] = {0xf6, 0x40, 0x20, 0x48, 0x74, -1, -1, 0x8b};
     u64 end = rx_start + rx_len;
     u64 match = 0;
-    if (scan_accept_pat(rx_start, end, orig, &match)) return 0;
-    if (scan_accept_pat(rx_start, end, patched, &match)) return 0;
+    u32 cnt = 0;
+    if (scan_accept_pat(rx_start, end, orig, &match, &cnt)) {
+        if (hits_out) *hits_out = cnt;
+        return 0;
+    }
+    if (scan_accept_pat(rx_start, end, patched, &match, &cnt)) {
+        if (hits_out) *hits_out = cnt;
+        return 0;
+    }
+    if (hits_out) *hits_out = cnt;
     return match;
 }
 
-static u64 resolve_lock_wrapper(u64 bt_start, u64 bt_len, const struct kr_range *ro, u32 n_ro, const char *name) {
-    u64 s = find_str_unique(ro, n_ro, name);
-    if (!s) return 0;
+u64 kr_resolve_accept_site(u64 rx_start, u64 rx_len) {
+    return kr_resolve_accept_site_ex(rx_start, rx_len, 0);
+}
+
+static u64 resolve_lock_wrapper(u64 bt_start, u64 bt_len, const struct kr_range *ro, u32 n_ro,
+                                const char *name, struct bt_koff *out) {
+    u32 hits = 0;
+    u64 s = find_str_unique_ex(ro, n_ro, name, &hits);
+    if (!s) { out->fail_sub = 1; out->fail_aux = hits; return 0; }
     u64 ref = find_lea_ref(bt_start, bt_len, s);
-    if (!ref) return 0;
+    if (!ref) { out->fail_sub = 2; out->fail_aux = 0; return 0; }
     u64 helper = walk_prologue(ref, bt_start, 0x80);
-    if (!helper) return 0;
-    return find_wrapper_before(helper, bt_start);
+    if (!helper) { out->fail_sub = 3; out->fail_aux = 0; return 0; }
+    u64 wrap = find_wrapper_before(helper, bt_start);
+    if (!wrap) { out->fail_sub = 4; out->fail_aux = 0; return 0; }
+    return wrap;
 }
 
 static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
@@ -238,14 +274,22 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
     static const s16 call_a[] = {0xbe, 0x0f, 0x04, 0x00, 0x00, 0x41, 0xb8, 0x18, 0x3c, 0x00, 0x00};
     static const s16 call_b[] = {0x41, 0xb8, 0x18, 0x3c, 0x00, 0x00, 0xbe, 0x0f, 0x04, 0x00, 0x00};
 
+ main
     u64 e = scan_unique(bt_start, bt_len, err_0b02, sizeof(err_0b02) / sizeof(err_0b02[0]));
     if (!e) return -1;
     u64 cmd_fn = walk_prologue(e, bt_start, 0x160);
     if (!cmd_fn) return -1;
 
-    u64 c3c18 = scan_unique(bt_start, bt_len, call_a, sizeof(call_a) / sizeof(call_a[0]));
-    if (!c3c18) c3c18 = scan_unique(bt_start, bt_len, call_b, sizeof(call_b) / sizeof(call_b[0]));
-    if (!c3c18) return -1;
+    u32 hits = 0;
+    u64 e = scan_unique_ex(bt_start, bt_len, err_0b02, sizeof(err_0b02) / sizeof(err_0b02[0]), &hits);
+    if (!e) { out->fail_sub = 1; out->fail_aux = hits; return -1; }
+    u64 cmd_fn = walk_prologue(e, bt_start, 0xe0);
+    if (!cmd_fn) { out->fail_sub = 2; out->fail_aux = 0; return -1; }
+ main
+
+    u64 c3c18 = scan_unique_ex(bt_start, bt_len, call_a, sizeof(call_a) / sizeof(call_a[0]), &hits);
+    if (!c3c18) c3c18 = scan_unique_ex(bt_start, bt_len, call_b, sizeof(call_b) / sizeof(call_b[0]), &hits);
+    if (!c3c18) { out->fail_sub = 3; out->fail_aux = hits; return -1; }
 
     /* Locate `lea rdx, [rip + disp32]` -> "22\0" near the 0x40f / 0x3c18 call setup. */
     u64 fmt = 0;
@@ -261,7 +305,7 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
             }
         }
     }
-    if (!fmt) return -1;
+    if (!fmt) { out->fail_sub = 4; out->fail_aux = 0; return -1; }
 
     /* Confirm control flow from c3c18 reaches cmd_fn (direct or via one short jmp). */
     u64 p = c3c18 + 11;
@@ -282,32 +326,35 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
         }
         p++;
     }
-    if (!confirmed) return -1;
+    if (!confirmed) { out->fail_sub = 5; out->fail_aux = 0; return -1; }
 
     /* Optionally refine policy/state offsets from the surrounding fn_3c18 function. */
     u64 fn3_start = walk_prologue(c3c18, bt_start, 0x160);
     if (fn3_start) {
+        int got = 0;
         static const s16 pol_pat[] = {0x81, 0xb8, -1, -1, 0x00, 0x00, 0x18, 0x3c, 0x00, 0x00};
         u64 pol_hit = scan_first(fn3_start, c3c18 - fn3_start, pol_pat, sizeof(pol_pat) / sizeof(pol_pat[0]));
-        if (pol_hit) out->conn_policy_off = rd32(pol_hit + 2);
+        if (pol_hit) { out->conn_policy_off = rd32(pol_hit + 2); got |= 1; }
         static const s16 st_pat[] = {0x83, 0xb8, -1, -1, 0x00, 0x00, 0x03};
         u64 st_hit = scan_first(fn3_start, c3c18 - fn3_start, st_pat, sizeof(st_pat) / sizeof(st_pat[0]));
-        if (st_hit) out->conn_state_off = rd32(st_hit + 2);
+        if (st_hit) { out->conn_state_off = rd32(st_hit + 2); got |= 2; }
         /* Scan [fn3_start, fn3_start + 0x20] for `mov rcx, [rdi + dev_off]` (48 8b 8f/87 disp32). */
         for (u64 k = fn3_start; k + 7 <= fn3_start + 0x20; k++) {
             if (*(const u8 *)k == 0x48 && *(const u8 *)(k + 1) == 0x8b &&
                 (*(const u8 *)(k + 2) == 0x8f || *(const u8 *)(k + 2) == 0x87)) {
                 u32 doff = rd32(k + 3);
-                if (doff >= 0x100 && doff <= 0x1500) { out->conn_dev_off = doff; break; }
+                if (doff >= 0x100 && doff <= 0x1500) { out->conn_dev_off = doff; got |= 4; break; }
             }
         }
         /* Scan [w0, w1] for `movzx ecx, word ptr [rax + handle_off]` (0f b7 48 off8). */
         for (u64 k = w0; k + 4 <= w1; k++) {
             if (*(const u8 *)k == 0x0f && *(const u8 *)(k + 1) == 0xb7 && *(const u8 *)(k + 2) == 0x48) {
                 out->conn_handle_off = *(const u8 *)(k + 3);
+                got |= 8;
                 break;
             }
         }
+        if (got == 15) out->resolved_mask |= KR_RES_CONN_LAYOUT;
     }
 
     out->cmd_fn = cmd_fn;
@@ -332,6 +379,7 @@ static void resolve_role_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
                     if ((cand >> 48) == 0xffff &&
                         *(const u8 *)cand == '6' && *(const u8 *)(cand + 1) == '1' && *(const u8 *)(cand + 2) == 0) {
                         out->fmt_role_str = cand;
+                        out->resolved_mask |= KR_RES_ROLE_FMT;
                         break;
                     }
                 }
@@ -346,6 +394,7 @@ static void resolve_role_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
                             u32 off8 = *(const u8 *)(a + 3);
                             if (off8 >= 0x20 && off8 <= 0x80) {
                                 out->conn_bdaddr_off = off8;
+                                out->resolved_mask |= KR_RES_BDADDR_OFF;
                                 break;
                             }
                         }
@@ -390,6 +439,7 @@ static void resolve_audio_off(u64 bt_start, u64 bt_len, struct bt_koff *out) {
         }
         if (idiv_at && dropped) {
             out->stream_dropped_off = dropped;
+            out->resolved_mask |= KR_RES_AUDIO_OFF;
             if (hit >= w_idiv + 6 && *(const u8 *)(hit - 6) == 0x03) {
                 u32 inf = rd32(hit - 4);
                 if (inf >= 0x1000 && inf < 0x8000) out->stream_inflight_off = inf;
@@ -414,8 +464,10 @@ static void resolve_audio_off(u64 bt_start, u64 bt_len, struct bt_koff *out) {
                     for (u64 b = scan0; b + 6 <= a; b++) {
                         if (*(const u8 *)b == 0x8b && (*(const u8 *)(b + 1) & 0xc0) == 0x80) {
                             u32 d = rd32(b + 2);
-                            if (d >= 0x1000 && d < 0x8000) out->stream_bitpool_off = d;
-                            else if (d >= 0x600 && d < 0x1500) {
+                            if (d >= 0x1000 && d < 0x8000) {
+                                out->stream_bitpool_off = d;
+                                out->resolved_mask |= KR_RES_BITPOOL_OFF;
+                            } else if (d >= 0x600 && d < 0x1500) {
                                 out->conn_max_bp_off = d;
                                 out->conn_min_bp_off = d - 4;
                             }
@@ -435,9 +487,9 @@ static int resolve_cache_and_bounds(u64 bt_start, u64 bt_len, struct bt_koff *ou
     static const s16 pat_0107[] = {0x41, 0xbc, 0x07, 0x01, 0x2f, 0x80};
 
     u64 hit = scan_first(bt_start, bt_len, pat_3200, sizeof(pat_3200) / sizeof(pat_3200[0]));
-    if (!hit) return -1;
+    if (!hit) { out->fail_sub = 1; return -1; }
     u64 cache_fn = walk_prologue(hit, bt_start, 0xa0);
-    if (!cache_fn) return -1;
+    if (!cache_fn) { out->fail_sub = 2; return -1; }
     out->cache_fn = cache_fn;
 
     /* Extract/verify cache array bounds & stride from name_lookup (0x802f0107) if matching. */
@@ -463,46 +515,57 @@ static int resolve_cache_and_bounds(u64 bt_start, u64 bt_len, struct bt_koff *ou
                 out->cache_off = c_off;
                 out->cache_end = c_end;
                 out->cache_stride = c_stride;
+                out->resolved_mask |= KR_RES_CACHE_BOUNDS;
             }
         }
     }
     return 0;
 }
 
-static u64 resolve_ctx_ptr(u64 bt_start, u64 bt_len, const struct kr_range *ro, u32 n_ro) {
+static u64 resolve_ctx_ptr(u64 bt_start, u64 bt_len, const struct kr_range *ro, u32 n_ro, struct bt_koff *out) {
     static const s16 store_pat[] = {
         0xba, 0x01, 0x01, 0x00, 0x00,
         0xe8, -1, -1, -1, -1,
         0x48, 0x85, 0xc0,
         0x48, 0x89, 0x05, -1, -1, -1, -1
     };
-    u64 s_drv = find_str_unique(ro, n_ro, "SceBtDriver");
-    if (!s_drv) return 0;
+    u32 hits = 0;
+    u64 s_drv = find_str_unique_ex(ro, n_ro, "SceBtDriver", &hits);
+    if (!s_drv) { out->fail_sub = 1; out->fail_aux = hits; return 0; }
     u64 ref_drv = find_lea_ref(bt_start, bt_len, s_drv);
-    if (!ref_drv) return 0;
+    if (!ref_drv) { out->fail_sub = 2; out->fail_aux = 0; return 0; }
     u64 w = (ref_drv > bt_start + 0xa0) ? (ref_drv - 0xa0) : bt_start;
     u64 hit = scan_first(w, ref_drv - w, store_pat, sizeof(store_pat) / sizeof(store_pat[0]));
-    if (!hit) return 0;
+    if (!hit) { out->fail_sub = 3; out->fail_aux = 0; return 0; }
     u64 ctx_ptr = (hit + 20) + (u64)(s64)rds32(hit + 16);
-    return ((ctx_ptr >> 48) == 0xffff) ? ctx_ptr : 0;
+    if ((ctx_ptr >> 48) != 0xffff) { out->fail_sub = 4; out->fail_aux = 0; return 0; }
+    return ctx_ptr;
 }
 
 int kr_resolve_bt(u64 base, struct bt_koff *out) {
     for (u64 i = 0; i < sizeof(*out); i++) ((volatile u8 *)out)[i] = 0;
 
+    out->base = base;
     u64 rx_start = 0, rx_len = 0;
-    if (kr_rx_bounds(base, &rx_start, &rx_len)) { out->fail_stage = 1; return -1; }
+    if (kr_rx_bounds(base, &rx_start, &rx_len)) {
+        out->fail_stage = 1;
+        out->fail_aux = rd16(base + 0x38);
+        return -1;
+    }
+    out->rx_start = rx_start;
+    out->rx_len = rx_len;
 
     struct kr_range ro[4];
     u32 n_ro = kr_ro_ranges(base, ro, 4);
+    out->ro_count = n_ro;
     if (!n_ro) { ro[0].start = rx_start; ro[0].len = rx_len; n_ro = 1; }
 
-    out->base = base;
-    out->copyout_fn = kr_resolve_copyout(rx_start, rx_len);
-    if (!out->copyout_fn) { out->fail_stage = 2; return -1; }
+    u32 hits = 0;
+    out->copyout_fn = kr_resolve_copyout_ex(rx_start, rx_len, &hits);
+    if (!out->copyout_fn) { out->fail_stage = 2; out->fail_aux = hits; return -1; }
 
-    u64 site = kr_resolve_accept_site(rx_start, rx_len);
-    if (!site) { out->fail_stage = 3; return -1; }
+    u64 site = kr_resolve_accept_site_ex(rx_start, rx_len, &hits);
+    if (!site) { out->fail_stage = 3; out->fail_aux = hits; return -1; }
     out->accept_site = site;
 
     u64 rx_end = rx_start + rx_len;
@@ -532,19 +595,21 @@ int kr_resolve_bt(u64 base, struct bt_koff *out) {
     out->stream_bitpool_off = 0x43d0;
     out->stream_enc_bp_off = 0x5c;
 
-    out->lock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_lock");
+    out->lock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_lock", out);
     if (!out->lock_fn) { out->fail_stage = 4; return -1; }
 
-    out->unlock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_unlock");
+    out->unlock_fn = resolve_lock_wrapper(bt_start, bt_len, ro, n_ro, "bt_sdio_unlock", out);
     if (!out->unlock_fn) { out->fail_stage = 5; return -1; }
 
     if (resolve_cmd_and_fmt(bt_start, bt_len, out)) { out->fail_stage = 6; return -1; }
     if (resolve_cache_and_bounds(bt_start, bt_len, out)) { out->fail_stage = 7; return -1; }
-    out->ctx_ptr = resolve_ctx_ptr(bt_start, bt_len, ro, n_ro);
+    out->ctx_ptr = resolve_ctx_ptr(bt_start, bt_len, ro, n_ro, out);
     if (!out->ctx_ptr) { out->fail_stage = 8; return -1; }
     resolve_role_fmt(bt_start, bt_len, out);
     resolve_audio_off(bt_start, bt_len, out);
 
+    out->fail_sub = 0;
+    out->fail_aux = 0;
     out->valid = 1;
     return 0;
 }

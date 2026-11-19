@@ -24,7 +24,46 @@ int32_t sceHttpSetResponseHeaderMaxSize(int32_t id,size_t headerSize);
 #include "ui.h"
 
 static int pad=-1,pad_connected;
-static uint64_t pad_retry,g_start,last_launch_try;
+static uint64_t pad_retry,g_start,last_launch_try,app_flush_at,app_direct_at;
+
+#define APP_RING_SIZE 32768U
+static char app_ring[APP_RING_SIZE];
+static size_t app_head,app_tail;
+static uint64_t app_dropped,app_direct_offset;
+static uint32_t app_direct_seq=1;
+static char app_session_id[20];
+static int g_direct_busy;
+static char g_direct_buf[8192];
+static size_t g_direct_len;
+
+static void app_ring_push(const char*data,size_t len){
+ if(!len||len>=APP_RING_SIZE)return;
+ while(APP_RING_SIZE-(app_head-app_tail)<len){
+  size_t adv=0,avail=app_head-app_tail;
+  while(adv<avail&&app_ring[(app_tail+adv)&(APP_RING_SIZE-1)]!='\n')adv++;
+  if(adv<avail)adv++;
+  app_tail+=adv;
+  app_dropped++;
+ }
+ size_t idx=app_head&(APP_RING_SIZE-1);
+ size_t first=APP_RING_SIZE-idx;
+ if(first>=len)memcpy(app_ring+idx,data,len);
+ else{memcpy(app_ring+idx,data,first);memcpy(app_ring,data+first,len-first);}
+ app_head+=len;
+}
+static size_t app_ring_peek(char*out,size_t max_len){
+ size_t avail=app_head-app_tail;
+ if(!avail)return 0;
+ size_t len=avail>max_len?max_len:avail;
+ size_t idx=app_tail&(APP_RING_SIZE-1);
+ size_t first=APP_RING_SIZE-idx;
+ if(first>=len)memcpy(out,app_ring+idx,len);
+ else{memcpy(out,app_ring+idx,first);memcpy(out+first,app_ring,len-first);}
+ if(avail>max_len){
+  for(size_t k=len;k>len/2;k--)if(out[k-1]=='\n'){len=k;break;}
+ }
+ return len;
+}
 
 /* All file I/O uses sceKernel* (never stdio): the app runs in a restricted
  * sandbox where a blocked libc syscall raises SIGSYS. app.log confirms these
@@ -36,7 +75,8 @@ static void logline(const char*s){
  char buf[320];
  int n=snprintf(buf,sizeof(buf),"[+%llu.%llus] %s\n",(unsigned long long)(t/10),(unsigned long long)(t%10),s);
  if(n<=0)return;
- if(n>(int)sizeof(buf))n=(int)sizeof(buf);
+ if(n>=(int)sizeof(buf)){n=(int)sizeof(buf)-1;buf[n-1]='\n';}
+ app_ring_push(buf,(size_t)n);
  int fd=sceKernelOpen("/data/bta_audio/app.log",0x209,0644);
  if(fd>=0){sceKernelWrite(fd,buf,(size_t)n);sceKernelClose(fd);}
 }
@@ -72,28 +112,60 @@ static unsigned controller(uint64_t now){
 
 /* ---- HTTP client: the audio service owns Bluetooth; this app only displays and requests ---- */
 enum { SOCKET_REFUSED = -2 };
-static int local_socket(int port){
- int fd=socket(AF_INET,SOCK_STREAM,0);if(fd<0)return -1;
+static int local_socket(int port,int*err_out){
+ if(err_out)*err_out=0;
+ int fd=socket(AF_INET,SOCK_STREAM,0);
+ if(fd<0){if(err_out)*err_out=errno;return -1;}
  struct timeval t={1,0};setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&t,sizeof(t));setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&t,sizeof(t));
  int one=1;setsockopt(fd,SOL_SOCKET,0x800,&one,sizeof(one));
  struct sockaddr_in a;memset(&a,0,sizeof(a));a.sin_len=sizeof(a);a.sin_family=AF_INET;a.sin_port=htons(port);a.sin_addr.s_addr=htonl(0x7f000001);
- if(connect(fd,(void*)&a,sizeof(a))<0){int rc=errno==ECONNREFUSED?SOCKET_REFUSED:-1;close(fd);return rc;}return fd;
+ if(connect(fd,(void*)&a,sizeof(a))<0){int e=errno;if(err_out)*err_out=e;int rc=e==ECONNREFUSED?SOCKET_REFUSED:-1;close(fd);return rc;}
+ return fd;
 }
-static int write_all(int fd,const void*p,size_t n){const char*b=p;while(n){ssize_t k=send(fd,b,n,0);if(k<=0)return -1;b+=k;n-=k;}return 0;}
+static int write_all(int fd,const void*p,size_t n,int*err_out){
+ if(err_out)*err_out=0;
+ const char*b=p;
+ while(n){ssize_t k=send(fd,b,n,0);if(k<=0){if(err_out)*err_out=k<0?errno:EPIPE;return -1;}b+=k;n-=(size_t)k;}
+ return 0;
+}
 /* Returns the HTTP status code, SOCKET_REFUSED if no listener, or -1 on other
  * transport errors. Copies the NUL-terminated response body into out when provided. */
-static int http(const char*method,const char*path,void*out,size_t cap){
- int fd=local_socket(8097);if(fd<0)return fd;
+static int http(const char*method,const char*path,void*out,size_t cap,int*err_out){
+ if(err_out)*err_out=0;
+ int fd=local_socket(8097,err_out);if(fd<0)return fd;
  char request[256];int len=snprintf(request,sizeof(request),"%s %s HTTP/1.1\r\nHost: 127.0.0.1:8097\r\nX-BTA-Control: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",method,path);
- if(len<0||len>=(int)sizeof(request)||write_all(fd,request,(size_t)len)){close(fd);return -1;}
+ if(len<0||len>=(int)sizeof(request)||write_all(fd,request,(size_t)len,err_out)){close(fd);return -1;}
  char response[16384];size_t used=0;
- while(used+1<sizeof(response)){ssize_t n=recv(fd,response+used,sizeof(response)-used-1,0);if(n==0)break;if(n<0){close(fd);return -1;}used+=(size_t)n;}
+ while(used+1<sizeof(response)){ssize_t n=recv(fd,response+used,sizeof(response)-used-1,0);if(n==0)break;if(n<0){if(err_out)*err_out=errno;close(fd);return -1;}used+=(size_t)n;}
  close(fd);response[used]=0;
- if(used<12||strncmp(response,"HTTP/1.1 ",9))return -1;
+ if(used<12||strncmp(response,"HTTP/1.1 ",9)){if(err_out)*err_out=-2;return -1;}
  int code=atoi(response+9);
  char*b=strstr(response,"\r\n\r\n");
  if(out&&cap){size_t bytes=0;if(b){b+=4;bytes=used-(size_t)(b-response);if(bytes>cap-1)bytes=cap-1;memcpy(out,b,bytes);}((char*)out)[bytes]=0;}
  return code>0?code:-1;
+}
+static void flush_app_logs_to_payload(int force){
+ if(!online||app_head==app_tail)return;
+ if(!force&&g_now<app_flush_at)return;
+ app_flush_at=g_now+500000;
+ for(int iter=0;iter<4&&app_head!=app_tail;iter++){
+  char chunk[1536];
+  size_t clen=app_ring_peek(chunk,sizeof(chunk));
+  if(!clen)break;
+  int err=0;
+  int fd=local_socket(8097,&err);
+  if(fd<0)break;
+  char hdr[256];
+  int hlen=snprintf(hdr,sizeof(hdr),
+   "POST /api/app-log HTTP/1.1\r\nHost: 127.0.0.1:8097\r\nX-BTA-Control: 1\r\n"
+   "Content-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",clen);
+  if(hlen<=0||hlen>=(int)sizeof(hdr)||write_all(fd,hdr,(size_t)hlen,&err)||write_all(fd,chunk,clen,&err)){close(fd);break;}
+  char resp[256];size_t used=0;
+  while(used+1<sizeof(resp)){ssize_t n=recv(fd,resp+used,sizeof(resp)-used-1,0);if(n<=0)break;used+=(size_t)n;}
+  close(fd);resp[used]=0;
+  if(used>=12&&!strncmp(resp,"HTTP/1.1 200",12)){app_tail+=clen;}
+  else break;
+ }
 }
 /* Reads /api/native. Older services send a shorter reply without the link fields;
  * those are accepted (ext_ok=0) and the UI falls back to the basic flags. */
@@ -117,23 +189,41 @@ static void log_service_change(void){
 }
 static int refresh(void){
  struct bt_native next;memset(&next,0,sizeof(next));
- int fd=local_socket(8097);if(fd<0){online=0;log_service_change();return -1;}
+ int err=0;
+ int fd=local_socket(8097,&err);
+ if(fd<0){
+  if(online){char m[96];snprintf(m,sizeof(m),"refresh: socket err=%d (fd=%d)",err,fd);logline(m);}
+  online=0;log_service_change();return -1;
+ }
  const char*req="GET /api/native HTTP/1.1\r\nHost: 127.0.0.1:8097\r\nConnection: close\r\n\r\n";
- if(write_all(fd,req,strlen(req))){close(fd);online=0;log_service_change();return -1;}
+ if(write_all(fd,req,strlen(req),&err)){
+  close(fd);
+  if(online){char m[96];snprintf(m,sizeof(m),"refresh: write err=%d",err);logline(m);}
+  online=0;log_service_change();return -1;
+ }
  char resp[8192];size_t used=0;
  while(used<sizeof(resp)){ssize_t n=recv(fd,resp+used,sizeof(resp)-used,0);if(n<=0)break;used+=(size_t)n;}
  close(fd);
- if(used<12||strncmp(resp,"HTTP/1.1 200",12)){online=0;log_service_change();return -1;}
+ if(used<12||strncmp(resp,"HTTP/1.1 200",12)){
+  char m[96];snprintf(m,sizeof(m),"refresh: bad HTTP response (used=%zu)",used);logline(m);
+  online=0;log_service_change();return -1;
+ }
  char*body=0;for(size_t i=0;i+3<used;i++)if(resp[i]=='\r'&&resp[i+1]=='\n'&&resp[i+2]=='\r'&&resp[i+3]=='\n'){body=resp+i+4;break;}
  size_t avail=body?(size_t)(resp+used-body):0;
- if(!body||avail<offsetof(struct bt_native,link)){online=0;log_service_change();return -1;}
+ if(!body||avail<offsetof(struct bt_native,link)){
+  char m[96];snprintf(m,sizeof(m),"refresh: short body (%zu bytes)",avail);logline(m);
+  online=0;log_service_change();return -1;
+ }
  memcpy(&next,body,avail<sizeof(next)?avail:sizeof(next));
- if(next.magic!=BT_NATIVE_MAGIC||next.version!=2||next.count<0||next.count>BT_DEVICE_LIMIT){online=0;log_service_change();return -1;}
+ if(next.magic!=BT_NATIVE_MAGIC||next.version!=2||next.count<0||next.count>BT_DEVICE_LIMIT){
+  char m[128];snprintf(m,sizeof(m),"refresh: invalid header magic=0x%x ver=%u count=%d",next.magic,next.version,next.count);logline(m);
+  online=0;log_service_change();return -1;
+ }
  unsigned long selected=(focus>=0&&focus<state.count)?state.devices[focus].address:0;
  state=next;ext_ok=avail>=sizeof(next);state.message[127]=0;for(int i=0;i<state.count;i++)state.devices[i].name[95]=0;
  if(selected){for(int i=0;i<state.count;i++)if(state.devices[i].address==selected)focus=i;}
  if(focus<0||focus>=state.count)focus=0;
- online=1;log_service_change();return 0;
+ online=1;log_service_change();flush_app_logs_to_payload(0);return 0;
 }
 static void set_notice(const char*s){snprintf(notice,sizeof(notice),"%s",s);notice_until=g_now+6000000;}
 
@@ -142,13 +232,17 @@ static enum service_phase service_phase=SERVICE_CHECK_VERSION;
 static uint64_t service_deadline;
 static char payload[131072];
 static size_t payload_size;
+static void trigger_direct_log_upload(int sync);
 
 static int read_payload_version(char*version,size_t cap){
- char body[96];
- int code=http("GET","/api/version",body,sizeof(body));
+ char body[96];int err=0;
+ int code=http("GET","/api/version",body,sizeof(body),&err);
  /* Older workers reject unknown GET routes. They put the version first in /api/status. */
- if(code==403||code==404)code=http("GET","/api/status",body,sizeof(body));
- if(code!=200)return code;
+ if(code==403||code==404)code=http("GET","/api/status",body,sizeof(body),&err);
+ if(code!=200){
+  if(code!=SOCKET_REFUSED){char m[96];snprintf(m,sizeof(m),"service: version check code=%d err=%d",code,err);logline(m);}
+  return code;
+ }
  static const char prefix[]="{\"version\":\"";
  if(strncmp(body,prefix,sizeof(prefix)-1))return -1;
  const char*value=body+sizeof(prefix)-1;
@@ -161,13 +255,13 @@ static int read_payload_version(char*version,size_t cap){
 
 static int load_bundled_payload(void){
  int f=sceKernelOpen("/app0/assets/BTA-Audio.bin",0,0);
- if(f<0){logline("start: bundled payload not found");set_notice("Bundled audio payload not found.");return -1;}
+ if(f<0){char m[96];snprintf(m,sizeof(m),"start: bundled payload open rc=0x%x",f);logline(m);set_notice("Bundled audio payload not found.");return -1;}
  long n=0;
  size_t used=0;
  while(used<sizeof(payload)){n=sceKernelRead(f,payload+used,sizeof(payload)-used);if(n<=0)break;used+=(size_t)n;}
  sceKernelClose(f);
  if(n<0||used<1024||used>=sizeof(payload)){
-  logline("start: could not read a complete bundled payload");
+  char m[112];snprintf(m,sizeof(m),"start: payload read failed (n=%ld used=%zu)",n,used);logline(m);
   set_notice("Could not read the bundled audio payload.");return -1;
  }
  payload_size=used;return 0;
@@ -175,17 +269,24 @@ static int load_bundled_payload(void){
 
 static void start_service(void){
  service_phase=SERVICE_MONITOR;
- if(!payload_size&&load_bundled_payload())return;
+ if(!payload_size&&load_bundled_payload()){trigger_direct_log_upload(0);return;}
  /* The BinLoader connection must carry the payload. A probe can consume its slot. */
  last_launch_try=sceKernelGetProcessTime();
- int fd=local_socket(9090);
+ int err=0;
+ int fd=local_socket(9090,&err);
  if(fd<0){
-  logline("start: BinLoader (9090) not reachable; enable it in GoldHEN and jailbreak again");
-  set_notice("BinLoader unavailable. Enable it in GoldHEN or run the jailbreak again.");return;
+  char m[128];snprintf(m,sizeof(m),"start: BinLoader (9090) unreachable (rc=%d errno=%d); enable it in GoldHEN",fd,err);
+  logline(m);
+  set_notice("BinLoader unavailable. Enable it in GoldHEN or run the jailbreak again.");
+  trigger_direct_log_upload(0);
+  return;
  }
- int rc=write_all(fd,payload,payload_size);close(fd);
- char msg[128];snprintf(msg,sizeof(msg),rc?"start: send failed (%zu bytes)":"start: payload sent to BinLoader (%zu bytes)",payload_size);logline(msg);
- if(rc){set_notice("Could not send the audio payload to BinLoader.");return;}
+ int rc=write_all(fd,payload,payload_size,&err);close(fd);
+ char msg[128];
+ if(rc)snprintf(msg,sizeof(msg),"start: send failed (%zu bytes, errno=%d)",payload_size,err);
+ else snprintf(msg,sizeof(msg),"start: payload sent to BinLoader (%zu bytes)",payload_size);
+ logline(msg);
+ if(rc){set_notice("Could not send the audio payload to BinLoader.");trigger_direct_log_upload(0);return;}
  service_phase=SERVICE_STARTING;
  service_deadline=sceKernelGetProcessTime()+15000000;
  set_notice("Starting audio service...");notice_until=service_deadline;
@@ -209,6 +310,7 @@ static void service_check(void){
    service_phase=SERVICE_MONITOR;
    logline("start: v" BTA_VERSION " payload did not become ready");
    set_notice("Audio payload did not start. Press X to retry.");
+   trigger_direct_log_upload(0);
   }
   return;
  }
@@ -218,6 +320,7 @@ static void service_check(void){
    service_phase=SERVICE_MONITOR;
    logline("sync: timed out waiting for the old payload to release port 8097");
    set_notice("Old audio payload did not stop. Press X to retry.");
+   trigger_direct_log_upload(0);
   }
   return;
  }
@@ -225,10 +328,11 @@ static void service_check(void){
 
  char msg[128];snprintf(msg,sizeof(msg),"sync: replacing payload v%s with v%s",version,BTA_VERSION);logline(msg);
  if(!payload_size&&load_bundled_payload()){service_phase=SERVICE_MONITOR;return;}
- code=http("POST","/api/quit",0,0);
+ int err=0;
+ code=http("POST","/api/quit",0,0,&err);
  if(code>=0&&code!=200){
   service_phase=SERVICE_MONITOR;
-  snprintf(msg,sizeof(msg),"sync: shutdown request failed (HTTP %d)",code);logline(msg);
+  snprintf(msg,sizeof(msg),"sync: shutdown request failed (HTTP %d, err=%d)",code,err);logline(msg);
   set_notice("Could not stop the old audio payload. Press X to retry.");return;
  }
  /* A dropped reply can still mean quit succeeded. Wait for the listener to close. */
@@ -237,10 +341,10 @@ static void service_check(void){
  set_notice("Updating audio service...");notice_until=service_deadline;
 }
 static void action(const char*path){
- char body[160];int code=http("POST",path,body,sizeof(body));
+ char body[160];int err=0;int code=http("POST",path,body,sizeof(body),&err);
  if(code==200)notice[0]=0;
  else if(code<0){
-  char msg[160];snprintf(msg,sizeof(msg),"http: POST %.80s failed (transport)",path);logline(msg);
+  char msg[160];snprintf(msg,sizeof(msg),"http: POST %.80s failed (rc=%d errno=%d)",path,code,err);logline(msg);
   set_notice("No response from the audio service.");
  }else{
   for(int i=0;body[i];i++)if(body[i]=='\n'||body[i]=='\r')body[i]=0;
@@ -266,6 +370,7 @@ static void activate(void){
  if(state.count<=0||focus<0||focus>=state.count)return;
  const struct bt_device*d=&state.devices[focus];int l=ui_link();
  if(d->address==state.selected&&l!=BT_LINK_IDLE){action("/api/stop");return;}
+ char msg[128];snprintf(msg,sizeof(msg),"action: select %012lX \"%.48s\"",d->address,d->name);logline(msg);
  char path[64];snprintf(path,sizeof(path),"/api/select/%012lX",d->address);action(path);
 }
 
@@ -329,6 +434,122 @@ static void close_http_ctx(struct http_ctx*ctx){
  ctx->net_id=ctx->ssl_id=ctx->http_id=ctx->tpl=-1;
 }
 
+static size_t g_direct_done;
+static void load_or_create_client_id(char out[17]){
+ char buf[32]={0};
+ int fd=sceKernelOpen("/data/bta_audio/client_id",0,0);
+ if(fd>=0){
+  ssize_t n=sceKernelRead(fd,buf,sizeof(buf)-1);
+  sceKernelClose(fd);
+  if(n>=16){
+   int ok=1;
+   for(int i=0;i<16;i++){
+    char c=buf[i];
+    if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))){ok=0;break;}
+    if(c>='A'&&c<='F')c=(char)(c+32);
+    out[i]=c;
+   }
+   if(ok){out[16]=0;return;}
+  }
+ }
+ uint64_t x=sceKernelGetProcessTime()^((uint64_t)(uintptr_t)out*0x9e3779b97f4a7c15ULL);
+ x^=x>>33;x*=0xff51afd7ed558ccdULL;x^=x>>33;x*=0xc4ceb9fe1a85ec53ULL;x^=x>>33;
+ if(!x)x=0x4254413441505031ULL;
+ snprintf(out,17,"%016llx",(unsigned long long)x);
+ fd=sceKernelOpen("/data/bta_audio/client_id.tmp",0x601,0644);
+ if(fd>=0){
+  ssize_t w=sceKernelWrite(fd,out,16);
+  sceKernelClose(fd);
+  if(w==16)sceKernelRename("/data/bta_audio/client_id.tmp","/data/bta_audio/client_id");
+ }
+}
+static void read_diag_endpoint(char out[320]){
+ const char*paths[2]={"/data/bta_audio/diag_url","/data/bta_audio/diag_url.txt"};
+ char raw[256]={0};
+ for(int i=0;i<2;i++){
+  int fd=sceKernelOpen(paths[i],0,0);
+  if(fd<0)continue;
+  ssize_t n=sceKernelRead(fd,raw,sizeof(raw)-1);
+  sceKernelClose(fd);
+  if(n>0){
+   raw[n]=0;
+   const char*p=raw;
+   if((unsigned char)p[0]==0xef&&(unsigned char)p[1]==0xbb&&(unsigned char)p[2]==0xbf)p+=3;
+   while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n')p++;
+   if(*p){
+    char clean[240];size_t j=0;
+    while(p[j]&&p[j]!=' '&&p[j]!='\t'&&p[j]!='\r'&&p[j]!='\n'&&p[j]!='?'&&p[j]!='#'&&j+1<sizeof(clean)){clean[j]=p[j];j++;}
+    while(j>0&&clean[j-1]=='/')j--;
+    clean[j]=0;
+    if(j>0){
+     const char*scheme=(strncmp(clean,"http://",7)==0||strncmp(clean,"https://",8)==0)?"":"http://";
+     if(j>=9&&strcmp(clean+j-9,"/api/logs")==0)snprintf(out,320,"%s%s",scheme,clean);
+     else snprintf(out,320,"%s%s/api/logs",scheme,clean);
+     return;
+    }
+   }
+  }
+ }
+ snprintf(out,320,"http://bta.alexutzu.pro/api/logs");
+}
+static void*direct_log_thread(void*arg){
+ (void)arg;
+ struct http_ctx ctx;
+ int conn=-1,req=-1;
+ char err[128]={0},cid[17]={0},base[320]={0},url[512]={0};
+ load_or_create_client_id(cid);
+ read_diag_endpoint(base);
+ if(!app_session_id[0]){
+  uint64_t x=sceKernelGetProcessTime()^((uint64_t)(uintptr_t)&ctx*0x9e3779b97f4a7c15ULL);
+  x^=x>>33;x*=0xff51afd7ed558ccdULL;x^=x>>33;
+  snprintf(app_session_id,sizeof(app_session_id),"app-%012llx",(unsigned long long)(x&0xffffffffffffULL));
+ }
+ snprintf(url,sizeof(url),"%s?client=%s&session=%s&seq=%u&offset=%llu&version=%s&kind=app&dropped=%llu",
+  base,cid,app_session_id,app_direct_seq,(unsigned long long)app_direct_offset,BTA_VERSION,(unsigned long long)app_dropped);
+ size_t len=g_direct_len;
+ if(len>0&&open_http_ctx(&ctx,"bta_applog",2000000,err,sizeof(err))==0){
+  conn=sceHttpCreateConnectionWithURL(ctx.tpl,url,0);
+  if(conn>=0){
+   req=sceHttpCreateRequestWithURL(conn,ORBIS_METHOD_POST,url,(uint64_t)len);
+   if(req>=0){
+    sceHttpAddRequestHeader(req,"Content-Type","text/plain; charset=utf-8",0);
+    if(sceHttpSendRequest(req,g_direct_buf,len)>=0){
+     int32_t code=0;
+     if(sceHttpGetStatusCode(req,&code)>=0&&code>=200&&code<300){
+      app_direct_seq++;
+      app_direct_offset+=len;
+      __atomic_store_n(&g_direct_done,len,__ATOMIC_RELEASE);
+     }
+    }
+   }
+  }
+  if(req>=0)sceHttpDeleteRequest(req);
+  if(conn>=0)sceHttpDeleteConnection(conn);
+  close_http_ctx(&ctx);
+ }
+ __atomic_store_n(&g_direct_busy,0,__ATOMIC_RELEASE);
+ return 0;
+}
+static void trigger_direct_log_upload(int sync){
+ if(app_head==app_tail||__atomic_load_n(&g_direct_busy,__ATOMIC_ACQUIRE))return;
+ if(!sync&&g_now<app_direct_at)return;
+ size_t len=app_ring_peek(g_direct_buf,sizeof(g_direct_buf));
+ if(!len)return;
+ g_direct_len=len;
+ __atomic_store_n(&g_direct_done,0,__ATOMIC_RELEASE);
+ __atomic_store_n(&g_direct_busy,1,__ATOMIC_RELEASE);
+ app_direct_at=g_now+15000000;
+ if(sync){
+  direct_log_thread(0);
+  size_t done=__atomic_exchange_n(&g_direct_done,0,__ATOMIC_ACQ_REL);
+  if(done<=app_head-app_tail)app_tail+=done;
+  return;
+ }
+ OrbisPthread th=0;
+ if(scePthreadCreate(&th,0,direct_log_thread,0,"BTAudio4Diag")==0)scePthreadDetach(th);
+ else __atomic_store_n(&g_direct_busy,0,__ATOMIC_RELEASE);
+}
+
 static int http_get_follow(int tpl,const char*start_url,const char*accept_hdr,int*conn_out,int*req_out,int32_t*status_out,char*err,size_t err_cap){
  char url[2048];
  snprintf(url,sizeof(url),"%s",start_url);
@@ -336,23 +557,23 @@ static int http_get_follow(int tpl,const char*start_url,const char*accept_hdr,in
 
  for(int hop=0;hop<6;hop++){
   int conn=sceHttpCreateConnectionWithURL(tpl,url,0);
-  if(conn<0){snprintf(err,err_cap,"Connection failed (0x%x)",conn);return -1;}
+  if(conn<0){snprintf(err,err_cap,"Connection failed (hop=%d rc=0x%x)",hop,conn);return -1;}
   int req=sceHttpCreateRequestWithURL(conn,ORBIS_METHOD_GET,url,0);
-  if(req<0){sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Request failed (0x%x)",req);return -1;}
+  if(req<0){sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Request failed (hop=%d rc=0x%x)",hop,req);return -1;}
   if(accept_hdr&&strncmp(url,"https://api.github.com/",23)==0)sceHttpAddRequestHeader(req,"Accept",accept_hdr,0);
 
   int rc=sceHttpSendRequest(req,0,0);
-  if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Send failed (0x%x)",rc);return -1;}
+  if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Send failed (hop=%d rc=0x%x)",hop,rc);return -1;}
   int32_t code=0;
   rc=sceHttpGetStatusCode(req,&code);
-  if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Status read failed (0x%x)",rc);return -1;}
+  if(rc<0){sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);snprintf(err,err_cap,"Status read failed (hop=%d rc=0x%x)",hop,rc);return -1;}
 
   if(code==301||code==302||code==303||code==307||code==308){
    char*hdrs=0;size_t hlen=0;char next_url[2048];
    int hrc=sceHttpGetAllResponseHeaders(req,&hdrs,&hlen);
    int got=(hrc>=0&&hdrs&&bta_extract_location_header(hdrs,hlen,next_url,sizeof(next_url))==0);
    sceHttpDeleteRequest(req);sceHttpDeleteConnection(conn);
-   if(!got){snprintf(err,err_cap,"Redirect missing Location header");return -1;}
+   if(!got){snprintf(err,err_cap,"Redirect missing Location header (hop=%d)",hop);return -1;}
    snprintf(url,sizeof(url),"%s",next_url);
    continue;
   }
@@ -574,12 +795,15 @@ static void start_pkg_download(void){
 
 int main(void){
  sceKernelMkdir("/data/bta_audio",0777);sceKernelChmod("/data/bta_audio",0777);log_rotate();g_start=sceKernelGetProcessTime();g_now=g_start;logline("BTAudio4 " BTA_VERSION " native app starting");
- int video=sceVideoOutOpen(0xff,0,0,0);if(video<0){logline("VideoOutOpen failed");return 1;}
+ int video=sceVideoOutOpen(0xff,0,0,0);if(video<0){char m[64];snprintf(m,sizeof(m),"VideoOutOpen failed (0x%x)",video);logline(m);trigger_direct_log_upload(1);return 1;}
  off_t memory;size_t size=8*1024*1024;void*base=0;
- if(sceKernelAllocateDirectMemory(0,sceKernelGetDirectMemorySize(),size,0x200000,3,&memory)<0||sceKernelMapDirectMemory(&base,size,0x33,0,memory,0x200000)<0){logline("Video memory failed");return 2;}
+ int dm_rc=sceKernelAllocateDirectMemory(0,sceKernelGetDirectMemorySize(),size,0x200000,3,&memory);
+ int mp_rc=dm_rc>=0?sceKernelMapDirectMemory(&base,size,0x33,0,memory,0x200000):0;
+ if(dm_rc<0||mp_rc<0){char m[96];snprintf(m,sizeof(m),"Video memory failed (alloc=0x%x map=0x%x)",dm_rc,mp_rc);logline(m);trigger_direct_log_upload(1);return 2;}
  void*buffers[2]={base,(char*)base+WIDTH*HEIGHT*4};OrbisVideoOutBufferAttribute attr;
  sceVideoOutSetBufferAttribute(&attr,0x80000000,1,0,WIDTH,HEIGHT,WIDTH);
- if(sceVideoOutRegisterBuffers(video,0,buffers,2,&attr)<0){logline("Register buffers failed");return 3;}
+ int rb_rc=sceVideoOutRegisterBuffers(video,0,buffers,2,&attr);
+ if(rb_rc<0){char m[64];snprintf(m,sizeof(m),"Register buffers failed (0x%x)",rb_rc);logline(m);trigger_direct_log_upload(1);return 3;}
  sceVideoOutSetFlipRate(video,1);
  OrbisUserServiceInitializeParams userparams={ORBIS_KERNEL_PRIO_FIFO_LOWEST};
  int user_rc=sceUserServiceInitialize(&userparams);int pad_rc=scePadInit();
@@ -591,6 +815,10 @@ int main(void){
  unsigned previous=0;int buffer=0,armed=0;long flip=0;uint64_t poll=0,repeat=0,first_draw=0,snap_cd=0,next_upd=sceKernelGetProcessTime()+60000000ULL;int pinmode=0,pinignore=0,digit=0,auto_snapped=0;char pin[5]="0000";
  for(;;){
   uint64_t now=sceKernelGetProcessTime();g_now=now;
+  if(!__atomic_load_n(&g_direct_busy,__ATOMIC_ACQUIRE)){
+   size_t done=__atomic_exchange_n(&g_direct_done,0,__ATOMIC_ACQ_REL);
+   if(done>0&&done<=app_head-app_tail)app_tail+=done;
+  }
   if(now>=next_upd){next_upd=now+60000000ULL;start_update_check();}
   if(__atomic_exchange_n(&g_upd_ready,0,__ATOMIC_ACQ_REL)){
    if(g_upd_result!=BTA_UPD_NONE){
@@ -671,6 +899,13 @@ int main(void){
   buffer^=1;flip++;
  }
  logline("Native app closed; audio service remains running");
+ if(online)flush_app_logs_to_payload(1);
+ if(!online&&app_head!=app_tail){
+  for(int w=0;w<50&&__atomic_load_n(&g_direct_busy,__ATOMIC_ACQUIRE);w++)sceKernelUsleep(20000);
+  size_t done=__atomic_exchange_n(&g_direct_done,0,__ATOMIC_ACQ_REL);
+  if(done>0&&done<=app_head-app_tail)app_tail+=done;
+  trigger_direct_log_upload(1);
+ }
  if(pad>=0)scePadClose(pad);
  sceVideoOutUnregisterBuffers(video,0);
  sceVideoOutClose(video);

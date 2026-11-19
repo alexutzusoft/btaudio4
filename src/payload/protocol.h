@@ -25,11 +25,19 @@ struct bt_native { unsigned magic,version; int streaming,wanted,tv,muted,scannin
  int volume_synced;       /* 1 when synced with headphone AVRCP hardware volume */
 };
 static inline int bt_is_audio(const struct bt_device*d){return (d->services&8)||(((d->cod>>8)&31)==4&&!(d->services&0x40));}
+#define BT_CONN_SNAP_LIMIT 8
+struct bt_conn_slot {
+ unsigned long bdaddr;
+ unsigned state,policy,dev_services;
+ unsigned short handle,stream_ok;
+};
 struct bt_prep_diag {
  int rc,skipped;
  unsigned conn_state,conn_policy,dev_services;
  unsigned short handle,reserved;
  int lps_rc,role_rc;
+ int slot_count,pad;
+ struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
 };
 struct bt_stream_diag {
  int rc;
@@ -41,6 +49,8 @@ struct bt_stream_diag {
  int enc_bp;
  int min_bp;
  int max_bp;
+ int slot_count;
+ struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
 };
 struct bt_koff;
 int bt_list(struct bt_devices*);

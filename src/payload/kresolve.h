@@ -43,7 +43,21 @@ struct bt_koff {
     u64 fmt_role_str;
     u64 accept_site;
     u64 fail_stage;
+    u32 fail_sub;
+    u32 fail_aux;
+    u32 resolved_mask;
+    u32 ro_count;
+    u64 rx_start;
+    u64 rx_len;
+    u64 ctx_val;
 };
+
+#define KR_RES_CACHE_BOUNDS (1U << 0)
+#define KR_RES_CONN_LAYOUT  (1U << 1)
+#define KR_RES_ROLE_FMT     (1U << 2)
+#define KR_RES_BDADDR_OFF   (1U << 3)
+#define KR_RES_AUDIO_OFF    (1U << 4)
+#define KR_RES_BITPOOL_OFF  (1U << 5)
 
 u64 kr_find_base(void);
 int kr_rx_bounds(u64 base, u64 *start, u64 *len);

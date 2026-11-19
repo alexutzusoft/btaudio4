@@ -45,11 +45,33 @@ static int resolve_cb(void *td, struct resolve_args *a) {
     if (!base) return 101;
     struct bt_koff res;
     int bad = kr_resolve_bt(base, &res);
+    if (!bad && res.ctx_ptr && ((res.ctx_ptr >> 48) == 0xffff)) {
+        res.ctx_val = *(const u64 *)res.ctx_ptr;
+    }
     if (!res.copyout_fn) return 102;
     if (*(const u32 *)res.copyout_fn != 0xe5894855U) return 103;
     int (*copyout)(const void *, void *, u64) = (void *)res.copyout_fn;
     int cprc = copyout(&res, a->out, sizeof(res));
     return bad ? 102 : cprc;
+}
+
+static int snap_conn_slots(const struct bt_koff *k, unsigned char *ctx, struct bt_conn_slot *slots) {
+    int count = 0;
+    for (unsigned off = k->conn_off; off < k->conn_end && count < BT_CONN_SNAP_LIMIT; off += k->conn_stride) {
+        unsigned char *c = ctx + off;
+        u64 bdaddr = *(u64 *)(c + k->conn_bdaddr_off);
+        if (!bdaddr || (bdaddr >> 48)) continue;
+        struct bt_conn_slot *s = &slots[count++];
+        s->bdaddr = bdaddr;
+        s->state = *(unsigned *)(c + k->conn_state_off);
+        s->policy = *(unsigned *)(c + k->conn_policy_off);
+        s->handle = *(unsigned short *)(c + k->conn_handle_off);
+        unsigned char *d = *(void **)(c + k->conn_dev_off);
+        s->dev_services = (d && ((u64)d >> 48) == 0xffff) ? *(unsigned *)(d + 0x20) : 0xffffffffU;
+        unsigned char *st = k->conn_stream_off ? *(void **)(c + k->conn_stream_off) : 0;
+        s->stream_ok = (st && ((u64)st >> 48) == 0xffff) ? 1 : 0;
+    }
+    return count;
 }
 
 static int callback(void *td, struct args *a) {
@@ -151,6 +173,9 @@ static int callback(void *td, struct args *a) {
             break;
         }
         d_out.rc = rc;
+        if (rc != 0 && in->diag) {
+            d_out.slot_count = snap_conn_slots(k, ctx, d_out.slots);
+        }
         unlock(0);
         if (in->diag) {
             int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
@@ -207,6 +232,9 @@ static int callback(void *td, struct args *a) {
             }
         }
         s_out.rc = rc;
+        if (rc != 0 && in->sdiag) {
+            s_out.slot_count = snap_conn_slots(k, ctx, s_out.slots);
+        }
         unlock(0);
         if (in->sdiag) {
             int (*copyout)(const void *, void *, u64) = (void *)k->copyout_fn;
