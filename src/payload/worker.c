@@ -1538,7 +1538,7 @@ void*bta_worker(void*arg){
   network_ready=wait_worker(&a,deadline);
  }
  stop_sender(&a);
- end_scan(&a);stop_audio(&a);a.wanted=0;message(&a,"Bluetooth Audio is offline. TV sound restored.");char json[12000];unsigned n=status(&a,json,sizeof(json));put("/data/bta_audio/status.json",json,n);
+ end_scan(&a);stop_audio(&a);drop_link(&a);a.wanted=0;message(&a,"Bluetooth Audio is offline. TV sound restored.");char json[12000];unsigned n=status(&a,json,sizeof(json));put("/data/bta_audio/status.json",json,n);
  if(wlog_begin(&a,a.clock(),"worker_stop")){
   wlog_raw(&a,"quit=");wlog_dec(&a,a.quit);wlog_raw(&a," packets=");wlog_dec(&a,(long)a.packets);
   wlog_raw(&a," errors=");wlog_dec(&a,(long)a.errors);wlog_raw(&a," resyncs=");wlog_dec(&a,(long)a.resyncs);
@@ -1547,10 +1547,12 @@ void*bta_worker(void*arg){
   wlog_end(&a,1);
  }
  wlog_flush(&a,a.clock(),1);
+ for(int i=0;i<4;i++){closefd(a.clients[i].fd);a.clients[i].fd=-1;}
+ closefd(a.listener);a.listener=-1;
+ closefd(a.bt);a.bt=-1;
+ closefd(a.hdmi);a.hdmi=-1;
  diag_stop(&a.diag);
  if(a.cond_rc==0)a.destroy_cond(&a.audio_cond);
  if(a.destroy_mutex)a.destroy_mutex(&a.mutex);
- for(int i=0;i<4;i++)closefd(a.clients[i].fd);
- closefd(a.bt);closefd(a.hdmi);closefd(a.listener);
  return 0;
 }

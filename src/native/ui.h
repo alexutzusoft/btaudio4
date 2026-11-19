@@ -304,7 +304,7 @@ static void draw_playback(int l,const struct bt_device*target,int pinmode,uint64
 
  const char*notice_text=NULL;
  if(notice[0]&&g_now<notice_until)notice_text=notice;
- else if(l==UI_OFFLINE)notice_text="Press X to start the audio service. If it stays offline, check that GoldHEN's BinLoader is enabled.";
+ else if(l==UI_OFFLINE)notice_text="Press X or L2 to start the audio service. If it stays offline, check that GoldHEN's BinLoader is enabled.";
  else if(!pinmode&&(l==BT_LINK_LOST||l==BT_LINK_FAILED||l==BT_LINK_CONNECTING||l==BT_LINK_SEARCHING)){
   if(ext_ok&&state.retry_ms>0){
    snprintf(buf,sizeof(buf),"%s%sRetrying in %ds.",state.message,state.message[0]?" ":"",secs(state.retry_ms));
@@ -389,7 +389,11 @@ static void draw_shortcuts(int l,int n){
  if(l==BT_LINK_IDLE&&n>0)shortcut(x,592,"Scan",I_BTRI,NULL,NULL,MUTED);
  else if(l!=UI_OFFLINE&&l!=BT_LINK_IDLE&&focus>=0&&focus<n&&state.devices[focus].address!=state.selected)
   shortcut(x,592,l==BT_LINK_STREAMING?"Disconnect":"Stop trying",I_BTRI,NULL,NULL,MUTED);
- shortcut(1194-text_w(F_SMALL,"Close")-22,592,"Close",I_BCIRCLE,NULL,NULL,MUTED);
+ const char*pwr=l==UI_OFFLINE?"Start payload":"Unload payload";
+ int close_x=1194-text_w(F_SMALL,"Close")-22;
+ int pwr_w=text_w(F_KEY,"L2")+14+8+text_w(F_SMALL,pwr);
+ shortcut(close_x-26-pwr_w,592,pwr,-1,"L2",NULL,MUTED);
+ shortcut(close_x,592,"Close",I_BCIRCLE,NULL,NULL,MUTED);
 }
 
 /* Dialogs share a centered surface with left-aligned copy and bottom actions. */

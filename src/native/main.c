@@ -225,11 +225,11 @@ static int refresh(void){
  state=next;ext_ok=avail>=sizeof(next);state.message[127]=0;for(int i=0;i<state.count;i++)state.devices[i].name[95]=0;
  if(selected){for(int i=0;i<state.count;i++)if(state.devices[i].address==selected)focus=i;}
  if(focus<0||focus>=state.count)focus=0;
- online=1;log_service_change();flush_app_logs_to_payload(0);return 0;
+ online=1;last_launch_try=0;log_service_change();flush_app_logs_to_payload(0);return 0;
 }
 static void set_notice(const char*s){snprintf(notice,sizeof(notice),"%s",s);notice_until=g_now+6000000;}
 
-enum service_phase { SERVICE_CHECK_VERSION, SERVICE_STOPPING, SERVICE_STARTING, SERVICE_MONITOR };
+enum service_phase { SERVICE_CHECK_VERSION, SERVICE_STOPPING, SERVICE_STARTING, SERVICE_UNLOADING, SERVICE_MONITOR };
 static enum service_phase service_phase=SERVICE_CHECK_VERSION;
 static uint64_t service_deadline;
 static char payload[131072];
@@ -376,6 +376,19 @@ static void service_check(void){
 
  char version[64];
  int code=read_payload_version(version,sizeof(version));
+ if(service_phase==SERVICE_UNLOADING){
+  if(code==SOCKET_REFUSED){
+   set_service_phase(SERVICE_MONITOR);
+   set_notice("Audio payload unloaded. Press L2 to start it again.");
+   return;
+  }
+  if(g_now>=service_deadline){
+   set_service_phase(SERVICE_MONITOR);
+   logline("unload: timed out waiting for payload to release port 8097");
+   set_notice("Could not unload audio payload. Try again.");
+  }
+  return;
+ }
  if(code==200&&!strcmp(version,BTA_VERSION)){
   if(refresh()==0&&service_phase!=SERVICE_MONITOR){
    logline("service: payload version matches v" BTA_VERSION);
@@ -444,7 +457,7 @@ static void volume_change(int amount){
 }
 static void activate(void){
  if(!online){
-  if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING)return;
+  if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING||service_phase==SERVICE_UNLOADING)return;
   if(last_launch_try&&g_now<last_launch_try+5000000){
    logline("activate: BinLoader retry skipped (cooldown; BinLoader may only accept 1 payload per jailbreak)");
    set_notice("Service offline. Wait a moment or re-enable BinLoader.");
@@ -457,6 +470,42 @@ static void activate(void){
  if(d->address==state.selected&&l!=BT_LINK_IDLE){action("/api/stop");return;}
  char msg[128];snprintf(msg,sizeof(msg),"action: select %012lX \"%.48s\"",d->address,d->name);logline(msg);
  char path[64];snprintf(path,sizeof(path),"/api/select/%012lX",d->address);action(path);
+}
+static void toggle_payload(void){
+ if(online){
+  logline("action: unload payload");
+  flush_app_logs_to_payload(1);
+  int err=0;
+  int code=http("POST","/api/quit",0,0,&err);
+  if(code>=0&&code!=200){
+   char msg[128];snprintf(msg,sizeof(msg),"unload: shutdown request failed (HTTP %d, err=%d)",code,err);logline(msg);
+   set_notice("Could not unload audio payload.");
+   refresh();
+   return;
+  }
+  online=0;
+  state.streaming=0;state.wanted=0;state.scanning=0;state.pin_pending=0;state.test=0;
+  state.link=BT_LINK_IDLE;state.meter=0;meter_s=0;
+  log_service_change();
+  set_service_phase(SERVICE_UNLOADING);
+  service_deadline=sceKernelGetProcessTime()+5000000;
+  set_notice("Unloading audio payload...");notice_until=service_deadline;
+  return;
+ }
+ if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING)return;
+ if(service_phase==SERVICE_UNLOADING){
+  char version[64];
+  if(read_payload_version(version,sizeof(version))!=SOCKET_REFUSED)return;
+  set_service_phase(SERVICE_MONITOR);
+ }
+ if(last_launch_try&&g_now<last_launch_try+5000000){
+  logline("toggle: BinLoader retry skipped (cooldown; BinLoader may only accept 1 payload per jailbreak)");
+  set_notice("Service offline. Wait a moment or re-enable BinLoader.");
+  return;
+ }
+ logline("action: start payload");
+ set_service_phase(SERVICE_CHECK_VERSION);
+ service_check();
 }
 
 static unsigned char snaprow[WIDTH*3];
@@ -1024,7 +1073,7 @@ int main(void){
    if(!online&&app_head!=app_tail)trigger_direct_log_upload(0);
    uint64_t interval=2000000;
    if(!online&&!__atomic_load_n(&g_uid_ready,__ATOMIC_ACQUIRE)&&now<g_uid_deadline)interval=100000;
-   else if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING)interval=250000;
+   else if(service_phase==SERVICE_STOPPING||service_phase==SERVICE_STARTING||service_phase==SERVICE_UNLOADING)interval=150000;
    else if(online)interval=ui_link()==BT_LINK_STREAMING?300000:500000;
    poll=sceKernelGetProcessTime()+interval;
   }
@@ -1054,6 +1103,7 @@ int main(void){
   }else{
    if(pressed&ORBIS_PAD_BUTTON_CIRCLE)break;
    if((pressed&ORBIS_PAD_BUTTON_R2)&&upd_state==BTA_UPD_OUTDATED&&upd_has_pkg){start_pkg_download();}
+   if(pressed&ORBIS_PAD_BUTTON_L2){toggle_payload();if(service_phase==SERVICE_UNLOADING)poll=now+150000;}
    if(state.count>0){
     if(pressed&ORBIS_PAD_BUTTON_DOWN)focus=(focus+1)%state.count;
     if(pressed&ORBIS_PAD_BUTTON_UP)focus=(focus+state.count-1)%state.count;
