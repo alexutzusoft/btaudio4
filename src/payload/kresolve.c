@@ -215,6 +215,8 @@ static int scan_accept_pat(u64 rx_start, u64 end, const s16 *pat, u64 *match, u3
         u64 hit = scan_first(pos, end - pos, pat, 8);
         if (!hit) break;
         u64 w_end = (hit + 96 < end) ? (hit + 96) : end;
+        u8 rex7 = *(const u8 *)(hit + 6);
+        if (rex7 != 0x48 && rex7 != 0x49) { pos = hit + 1; continue; }
         if (hit + 16 < w_end && scan_has_err(hit + 16, w_end)) {
             if (*cnt < 0xffffffffU) (*cnt)++;
             if (*match && *match != hit) return -1;
@@ -229,8 +231,10 @@ static u64 kr_resolve_accept_site_ex(u64 rx_start, u64 rx_len, u32 *hits_out) {
     /* Accept either unpatched (cmp dword [rax+0x20],0x40; jne +??; mov ..., [r12..])
      * or already-patched (test byte [rax+0x20],0x48; je +??; mov ..., [r12..]) form,
      * anchored by the Sony BT error codes (0x802f3401/0x802f3403) right after it. */
-    static const s16 orig[] = {0x83, 0x78, 0x20, 0x40, 0x75, -1, 0x49, 0x8b};
-    static const s16 patched[] = {0xf6, 0x40, 0x20, 0x48, 0x74, -1, 0x49, 0x8b};
+    /* byte[6] wildcarded — 0x48 (REX.W) and 0x49 (REX.WB) both valid on 11.50 codegen;
+     * rex7 check in scan_accept_pat gates the wildcard to those two values only. */
+    static const s16 orig[]    = {0x83, 0x78, 0x20, 0x40, 0x75, -1, -1, 0x8b};
+    static const s16 patched[] = {0xf6, 0x40, 0x20, 0x48, 0x74, -1, -1, 0x8b};
     u64 end = rx_start + rx_len;
     u64 match = 0;
     u32 cnt = 0;
@@ -265,15 +269,23 @@ static u64 resolve_lock_wrapper(u64 bt_start, u64 bt_len, const struct kr_range 
 }
 
 static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
-    static const s16 err_0b02[] = {0x41, 0xbd, 0x02, 0x0b, 0x2f, 0x80};
+    /* 02 0b 2f 80 arrives in any GPR: REX+opcode bytes wildcarded, imm32 fixed. */
+    static const s16 err_0b02[] = {-1, -1, 0x02, 0x0b, 0x2f, 0x80};
     static const s16 call_a[] = {0xbe, 0x0f, 0x04, 0x00, 0x00, 0x41, 0xb8, 0x18, 0x3c, 0x00, 0x00};
     static const s16 call_b[] = {0x41, 0xb8, 0x18, 0x3c, 0x00, 0x00, 0xbe, 0x0f, 0x04, 0x00, 0x00};
+
+ main
+    u64 e = scan_unique(bt_start, bt_len, err_0b02, sizeof(err_0b02) / sizeof(err_0b02[0]));
+    if (!e) return -1;
+    u64 cmd_fn = walk_prologue(e, bt_start, 0x160);
+    if (!cmd_fn) return -1;
 
     u32 hits = 0;
     u64 e = scan_unique_ex(bt_start, bt_len, err_0b02, sizeof(err_0b02) / sizeof(err_0b02[0]), &hits);
     if (!e) { out->fail_sub = 1; out->fail_aux = hits; return -1; }
     u64 cmd_fn = walk_prologue(e, bt_start, 0xe0);
     if (!cmd_fn) { out->fail_sub = 2; out->fail_aux = 0; return -1; }
+ main
 
     u64 c3c18 = scan_unique_ex(bt_start, bt_len, call_a, sizeof(call_a) / sizeof(call_a[0]), &hits);
     if (!c3c18) c3c18 = scan_unique_ex(bt_start, bt_len, call_b, sizeof(call_b) / sizeof(call_b[0]), &hits);
@@ -317,7 +329,7 @@ static int resolve_cmd_and_fmt(u64 bt_start, u64 bt_len, struct bt_koff *out) {
     if (!confirmed) { out->fail_sub = 5; out->fail_aux = 0; return -1; }
 
     /* Optionally refine policy/state offsets from the surrounding fn_3c18 function. */
-    u64 fn3_start = walk_prologue(c3c18, bt_start, 0x180);
+    u64 fn3_start = walk_prologue(c3c18, bt_start, 0x160);
     if (fn3_start) {
         int got = 0;
         static const s16 pol_pat[] = {0x81, 0xb8, -1, -1, 0x00, 0x00, 0x18, 0x3c, 0x00, 0x00};
