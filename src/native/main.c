@@ -1027,7 +1027,7 @@ int main(void){
  sceVideoOutSetBufferAttribute(&attr,0x80000000,1,0,WIDTH,HEIGHT,WIDTH);
  int rb_rc=sceVideoOutRegisterBuffers(video,0,buffers,2,&attr);
  if(rb_rc<0){char m[64];snprintf(m,sizeof(m),"Register buffers failed (0x%x)",rb_rc);logline(m);trigger_direct_log_upload(1);return 3;}
- sceVideoOutSetFlipRate(video,1);
+ sceVideoOutSetFlipRate(video,0);
  OrbisUserServiceInitializeParams userparams={ORBIS_KERNEL_PRIO_FIFO_LOWEST};
  int user_rc=sceUserServiceInitialize(&userparams);int pad_rc=scePadInit();
  char diag[128];snprintf(diag,sizeof(diag),"User init=0x%x Pad init=0x%x",user_rc,pad_rc);logline(diag);
@@ -1035,7 +1035,7 @@ int main(void){
  start_update_check();
  logline("Starting display loop");
  focus=0;for(int i=0;i<state.count;i++)if(state.devices[i].address==state.selected)focus=i;
- unsigned previous=0;int buffer=0,armed=0;long flip=0;uint64_t poll=0,repeat=0,first_draw=0,snap_cd=0,next_upd=sceKernelGetProcessTime()+60000000ULL;int pinmode=0,pinignore=0,digit=0,auto_snapped=0;char pin[5]="0000";
+ unsigned previous=0,init_held=0;int buffer=0,armed=0;long flip=0;uint64_t poll=0,repeat=0,first_draw=0,snap_cd=0,next_upd=sceKernelGetProcessTime()+60000000ULL;int pinmode=0,pinignore=0,digit=0,auto_snapped=0;char pin[5]="0000";
  for(;;){
   uint64_t now=sceKernelGetProcessTime();g_now=now;
   if(!g_uid_logged&&__atomic_load_n(&g_uid_ready,__ATOMIC_ACQUIRE)){
@@ -1082,13 +1082,15 @@ int main(void){
   if(online&&state.pin_pending&&!pinmode&&!pinignore){pinmode=1;digit=0;memcpy(pin,"0000",5);}
   unsigned buttons=controller(now);
   /* A button still held from launching or resuming the app is not a new press. */
-  if(!pad_connected)armed=0;
-  if(!armed&&pad_connected){previous=buttons;armed=1;}
+  if(!pad_connected){armed=0;init_held=0;}
+  if(!armed&&pad_connected){previous=buttons;init_held=buttons;armed=1;}
+  init_held&=buttons;
   unsigned pressed=buttons&~previous;
   if(buttons==previous&&now>=repeat){pressed=buttons&(ORBIS_PAD_BUTTON_UP|ORBIS_PAD_BUTTON_DOWN|ORBIS_PAD_BUTTON_LEFT|ORBIS_PAD_BUTTON_RIGHT|ORBIS_PAD_BUTTON_L1|ORBIS_PAD_BUTTON_R1);repeat=now+150000;}
   else if(buttons!=previous)repeat=now+450000;
   previous=buttons;
   if(!armed)pressed=0;
+  g_held=armed?(buttons&~init_held):0;
   if(pinmode){
    if(pressed&ORBIS_PAD_BUTTON_LEFT)digit=(digit+3)%4;if(pressed&ORBIS_PAD_BUTTON_RIGHT)digit=(digit+1)%4;
    if(pressed&ORBIS_PAD_BUTTON_UP)pin[digit]=(char)('0'+(pin[digit]-'0'+1)%10);if(pressed&ORBIS_PAD_BUTTON_DOWN)pin[digit]=(char)('0'+(pin[digit]-'0'+9)%10);
@@ -1118,14 +1120,15 @@ int main(void){
   if(focus<0||focus>=state.count)focus=0;
   if(focus<top)top=focus;if(focus>=top+5)top=focus-4;if(top<0)top=0;
   {int target=(ext_ok&&ui_link()==BT_LINK_STREAMING)?state.meter:0;if(target<0)target=0;if(target>100)target=100;
-   if(target>meter_s)meter_s+=(target-meter_s+1)/2;else meter_s-=(meter_s-target+3)/4;}
+   if(target>meter_s)meter_s+=(target-meter_s+2)/4;else meter_s-=(meter_s-target+7)/8;}
+  g_now=sceKernelGetProcessTime();
   if(notice[0]&&g_now>=notice_until)notice[0]=0;
   draw(pinmode,pin,digit);
   memcpy(buffers[buffer],back,sizeof(back));
   if(!first_draw)first_draw=now;
   if(!auto_snapped&&now-first_draw>2000000){snapshot();auto_snapped=1;}
   if((buttons&(ORBIS_PAD_BUTTON_L3|ORBIS_PAD_BUTTON_R3))==(ORBIS_PAD_BUTTON_L3|ORBIS_PAD_BUTTON_R3)&&now>=snap_cd){snapshot();snap_cd=now+2000000;}
-  if(sceVideoOutSubmitFlip(video,buffer,1,flip)<0){sceKernelUsleep(33000);continue;}
+  if(sceVideoOutSubmitFlip(video,buffer,1,flip)<0){sceKernelUsleep(16000);continue;}
   if(flip==0)sceSystemServiceHideSplashScreen();
   for(int tries=0;tries<1000;tries++){OrbisVideoOutFlipStatus status;if(!sceVideoOutGetFlipStatus(video,&status)&&status.flipArg==flip)break;sceKernelUsleep(1000);}
   buffer^=1;flip++;
