@@ -23,8 +23,8 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $match = [regex]::Match((Get-Content -Raw src/version.h), '#define\s+BTA_VERSION\s+"(\d+\.\d+(?:\.\d+)?)"')
-          if (-not $match.Success) { throw 'Could not read BTA_VERSION from src/version.h.' }
+          $match = [regex]::Match((Get-Content -Raw src/common/version.h), '#define\s+BTA_VERSION\s+"(\d+\.\d+(?:\.\d+)?)"')
+          if (-not $match.Success) { throw 'Could not read BTA_VERSION from src/common/version.h.' }
           $version = $match.Groups[1].Value
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
             throw "Tag $env:GITHUB_REF_NAME does not match BTA_VERSION $version."
@@ -100,13 +100,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          powershell -ExecutionPolicy Bypass -File tools/build_app.ps1
+          powershell -ExecutionPolicy Bypass -File tools/build/payload.ps1
 
       - name: Build & validate PKG
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          powershell -ExecutionPolicy Bypass -File tools/build_native.ps1
+          powershell -ExecutionPolicy Bypass -File tools/build/pkg.ps1
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

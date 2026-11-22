@@ -1,0 +1,99 @@
+#ifndef BT_AUDIO_PROTOCOL_H
+#define BT_AUDIO_PROTOCOL_H
+#define BT_DEVICE_LIMIT 32
+#define BT_NATIVE_MAGIC 0x32415442u
+struct bt_device { unsigned long address; unsigned cod,services,flags,reserved; char name[96]; };
+struct bt_devices { unsigned count,reserved; struct bt_device items[BT_DEVICE_LIMIT]; };
+/* What the headphone link is really doing. A UI must show this, not guess it
+ * from "selected" or "wanted": a selected device may be offline or retrying. */
+#define BT_LINK_IDLE 0       /* nothing requested */
+#define BT_LINK_CONNECTING 1 /* attempt in progress */
+#define BT_LINK_STREAMING 2  /* audio is flowing to the headphones */
+#define BT_LINK_LOST 3       /* was streaming, link dropped, reconnecting */
+#define BT_LINK_FAILED 4     /* last attempt failed, waiting to retry */
+#define BT_LINK_SEARCHING 5  /* scanning for the selected headphones */
+#define BTA_PRESET_LOW_LATENCY 0
+#define BTA_PRESET_BALANCED    1
+#define BTA_PRESET_STABILITY   2
+#define BTA_PRESET_COUNT       3
+struct bt_native { unsigned magic,version; int streaming,wanted,tv,muted,scanning,count,pin_pending,volume; unsigned long selected; char message[128]; struct bt_device devices[BT_DEVICE_LIMIT];
+ /* Appended fields (service 2.5+). Apps built before them read only the prefix
+  * and ignore the rest; apps built with them must tolerate a shorter reply. */
+ int link;          /* BT_LINK_* */
+ int attempts;      /* connection attempts since the last successful stream */
+ int retry_ms;      /* until the next automatic attempt; 0 = none pending */
+ int meter;         /* recent output peak, 0..100 */
+ int quiet_ms;      /* while streaming: ms since a packet was last sent */
+ int test;          /* test tone playing */
+ int connect_rc,audio_rc; /* last driver results; 0 = fine */
+ int volume_synced;       /* 1 when synced with headphone AVRCP hardware volume */
+ int preset;              /* BTA_PRESET_* */
+ int bitpool;             /* active SBC bitpool */
+};
+static inline int bt_is_audio(const struct bt_device*d){return (d->services&8)||(((d->cod>>8)&31)==4&&!(d->services&0x40));}
+#define BT_CONN_SNAP_LIMIT 8
+struct bt_conn_slot {
+ unsigned long bdaddr;
+ unsigned state,policy,dev_services,dev_flags,dev_cod;
+ unsigned short handle,stream_ok;
+ int min_bp,max_bp;
+ unsigned st_dropped;
+ int st_inflight,st_queued,st_frames,st_bitpool,st_enc_bp;
+};
+struct bt_prep_diag {
+ int rc,skipped;
+ unsigned conn_state,conn_policy,dev_services;
+ unsigned short handle,reserved;
+ int lps_rc,role_rc;
+ int slot_count,pad;
+ struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
+};
+struct bt_stream_diag {
+ int rc;
+ unsigned dropped;
+ unsigned ring_drops;
+ int inflight;
+ int queued;
+ unsigned ring_used;
+ unsigned ring_cap;
+ int frames;
+ int rate_idx;
+ int bitpool;
+ int enc_bp;
+ int min_bp;
+ int max_bp;
+ int neg_rate;
+ int neg_ch;
+ int slot_count;
+ struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
+};
+struct bt_full_diag {
+ int rc;
+ int slot_count;
+ int target_found;
+ int pad;
+ unsigned long dev_ptr;
+ unsigned long conn_ptr;
+ unsigned long stream_ptr;
+ struct bt_conn_slot slots[BT_CONN_SNAP_LIMIT];
+ unsigned char dev_raw[160];
+ unsigned char conn_hdr[64];
+ unsigned char conn_tail[64];
+ unsigned char stream_cfg[128];
+};
+#define BTA_LAUNCH_MAGIC 0x01434e4c41544255ULL
+struct bta_launch_trace {
+ unsigned long magic;
+ int stage;
+ int rc;
+ unsigned long bytes;
+};
+struct bt_koff;
+int bt_list(struct bt_devices*);
+int bt_prepare(unsigned long address);
+int bt_prepare_diag(unsigned long address, struct bt_prep_diag *diag);
+int bt_stream_tune(unsigned long address, int target_bp, struct bt_stream_diag *diag);
+int bt_stream_peek(unsigned long address, struct bt_stream_diag *diag);
+int bt_full_diag(unsigned long address, struct bt_full_diag *diag);
+const struct bt_koff *bt_koff_info(void);
+#endif
