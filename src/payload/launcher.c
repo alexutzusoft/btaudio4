@@ -1,5 +1,5 @@
 #include "runtime.h"
-#include "protocol.h"
+#include "../common/protocol.h"
 extern const char __image_start[],__image_end[];
 void*memset(void*p,int value,u64 n){u8*d=p;while(n--)*d++=(u8)value;return p;}
 void*memcpy(void*d,const void*s,u64 n){u8*a=d;const u8*b=s;while(n--)*a++=*b++;return d;}
@@ -7,11 +7,28 @@ static void save_launch(int stage,int rc,u64 bytes){
  struct bta_launch_trace t={BTA_LAUNCH_MAGIC,stage,rc,bytes};
  put("/data/bta_audio/launcher.bin",&t,sizeof(t));
 }
-void notify(const char*message){
+void notify_with_icon(const char*message,const char*icon_uri){
  int(*send)(int,void*,u64,int)=0;if(resolve("sceKernelSendNotificationRequest",&send)||!send)return;
- u8 req[0xc30];memset(req,0,sizeof(req));*(int*)(req+0x10)=-1;
- u64 n=length(message);if(n>1023)n=1023;memcpy(req+0x2d,message,n);send(0,req,sizeof(req),0);
+ struct {
+  int type,request_id,priority,message_id,target_id,user_id,device_id,addressing_user_id,app_id,error_number,attribute;
+  u8 use_icon_uri;
+  char message[1024],icon_uri[1024],reserved[1027];
+ } req;
+ _Static_assert(sizeof(req)==0xc30,"PS4 notification request size");
+ memset(&req,0,sizeof(req));req.target_id=-1;
+ u64 n=length(message);
+ if(n>=sizeof(req.message))n=sizeof(req.message)-1;
+ memcpy(req.message,message,n);
+ if(icon_uri){
+  n=length(icon_uri);
+  if(n<sizeof(req.icon_uri)){
+   req.use_icon_uri=1;
+   memcpy(req.icon_uri,icon_uri,n);
+  }
+ }
+ send(0,&req,sizeof(req),0);
 }
+void notify(const char*message){notify_with_icon(message,0);}
 /* Run from our own mapping: GoldHEN is free to reuse its injection buffer. */
 __attribute__((section(".text.launcher"))) int _start(void){
  sc3(136,(long)"/data/bta_audio",0777,0);

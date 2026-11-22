@@ -19,10 +19,21 @@ static inline void closefd(long fd){if(fd>=0)sc3(6,fd,0,0);}
 static inline int exists(const char*p){long f=sc3(5,(long)p,0,0);if(f<0)return 0;closefd(f);return 1;}
 static inline long put(const char*p,const void*b,u64 n){long f=sc3(5,(long)p,0x601,0644);if(f<0)return f;long r=sc3(4,f,(long)b,n);closefd(f);return r==(long)n?0:-1;}
 static inline long resolve(const char*n,void*p){return sc3(591,0x2001,(long)n,(long)p);}
+static inline long load_system_module(const char *path){
+ int (*load)(const char *,u64,const void *,u32,void *,int *)=0;
+ if(!resolve("sceKernelLoadStartModule",&load)&&load){
+  int handle=load(path,0,0,0,0,0);
+  if(handle>0)return handle;
+ }
+ long handle=0;
+ if(!sc5(594,(long)path,0,(long)&handle,0,0)&&handle>0)return handle;
+ return 0;
+}
 struct sockaddr4{u8 len,family;u16 port;u32 addr;u8 zero[8];};
 static inline int local_ip(const u8*p){return p[0]==127||p[0]==10||(p[0]==192&&p[1]==168)||(p[0]==172&&p[1]>=16&&p[1]<=31);}
 static inline int nonblock(long fd){int v=1;return sc3(54,fd,0x8004667e,(long)&v);}
 void notify(const char*message);
+void notify_with_icon(const char*message,const char*icon_uri);
 void* bta_worker(void*);
 #define BTA_PORT 8097
 #define BTA_STOP "/data/bta_audio/stop"

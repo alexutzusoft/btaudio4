@@ -1,10 +1,11 @@
 #include "diag.h"
-#include "../version.h"
-#include "../uid.h"
+#include "../common/version.h"
+#include "../common/uid.h"
 
-#define DIAG_INTERVAL_US 3000000ULL
-#define DIAG_RELOAD_US   30000000ULL
-#define DIAG_DNS_TTL_US  300000000ULL
+#define DIAG_INTERVAL_US        3000000ULL
+#define DIAG_STREAM_INTERVAL_US 30000000ULL
+#define DIAG_RELOAD_US          30000000ULL
+#define DIAG_DNS_TTL_US         300000000ULL
 
 struct diag_url {
  char host[128];
@@ -249,20 +250,8 @@ static long get_scenet_handle(void) {
  static long cached_handle = 0;
  if (cached_handle > 0) return cached_handle;
 
- int (*load_mod)(const char *, u64, const void *, u32, void *, int *) = 0;
- if (!resolve("sceKernelLoadStartModule", &load_mod) && load_mod) {
-  int h = load_mod("/system/common/lib/libSceNet.sprx", 0, 0, 0, 0, 0);
-  if (h > 0) {
-   cached_handle = h;
-   return h;
-  }
- }
- long h = 0;
- if (!sc5(594, (long)"/system/common/lib/libSceNet.sprx", 0, (long)&h, 0, 0) && h > 0) {
-  cached_handle = h;
-  return h;
- }
- return 0;
+ cached_handle = load_system_module("/system/common/lib/libSceNet.sprx");
+ return cached_handle;
 }
 
 static int resolve_scenet(const char *host, u32 *ip_out) {
@@ -750,6 +739,11 @@ static void *diag_thread(void *arg) {
    if (u < next_send) next_send = u;
   }
 
+  int is_streaming = __atomic_load_n(&d->streaming, __ATOMIC_RELAXED);
+  if (!is_streaming && next_send > now + DIAG_INTERVAL_US) {
+   next_send = now + DIAG_INTERVAL_US;
+  }
+
   int due = !running || (avail >= DIAG_CHUNK_MAX) || (avail > 0 && now >= next_send);
   if (!due) {
    d->sleep(avail > 0 ? 50000 : 200000);
@@ -818,7 +812,8 @@ static void *diag_thread(void *arg) {
    }
    u32 cur_head = __atomic_load_n(&d->head, __ATOMIC_ACQUIRE);
    u32 rem = cur_head - (tail + ring_len);
-   next_send = d->clock() + (rem > 0 ? 50000ULL : DIAG_INTERVAL_US);
+   u64 idle_iv = __atomic_load_n(&d->streaming, __ATOMIC_RELAXED) ? DIAG_STREAM_INTERVAL_US : DIAG_INTERVAL_US;
+   next_send = d->clock() + (rem > 0 ? 50000ULL : idle_iv);
    if (rem > 0 && running) d->sleep(50000);
   } else {
    __atomic_fetch_add(&d->failed_sends, 1, __ATOMIC_RELAXED);

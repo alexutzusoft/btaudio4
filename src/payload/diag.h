@@ -26,6 +26,7 @@ struct diag_reporter {
  int run;
  int alive;
  int exited;
+ int streaming;
  u64 stop_deadline;
  void *thread;
  int (*sleep)(unsigned);

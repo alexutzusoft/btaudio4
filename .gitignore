@@ -1,5 +1,5 @@
-build/
-install_backups/
+/build/
+/install_backups/
 __pycache__/
 *.pyc
 server/data/
